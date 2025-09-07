@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6334:6334" # gRPC & HTTP API
+      - "6333:6333" # Dashboard (not used by Go client)
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  embedding-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.embedder
+    ports:
+      - "8000:8000" # Expose the FastAPI service
+    volumes:
+      - ./models:/app/models # Optional: persist downloaded models
+    restart: unless-stopped
+    # environment:
+    #   - MODEL_NAME=all-MiniLM-L6-v2
+
+volumes:
+  qdrant_data:
