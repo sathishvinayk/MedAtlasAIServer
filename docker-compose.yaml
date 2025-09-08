@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   qdrant:
     image: qdrant/qdrant:latest
@@ -9,6 +7,8 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
+    networks:
+      - medical-search-net
 
   embedding-service:
     build:
@@ -19,8 +19,32 @@ services:
     volumes:
       - ./models:/app/models # Optional: persist downloaded models
     restart: unless-stopped
-    # environment:
-    #   - MODEL_NAME=all-MiniLM-L6-v2
+    environment:
+      - MODEL_NAME=sentence-transformers/all-MiniLM-L6-v2
+    networks:
+      - medical-search-net
+
+  med-atlas-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    environment:
+      - PORT=8080
+      - QDRANT_HOST=qdrant:6334        # Use docker service name
+      - EMBEDDING_SERVICE_HOST=http://embedding-service:8000 # Use docker service name
+
+    depends_on:
+      - qdrant
+      - embedding-service
+    networks:
+      - medical-search-net
 
 volumes:
   qdrant_data:
+
+networks:
+  medical-search-net:
+    driver: bridge
