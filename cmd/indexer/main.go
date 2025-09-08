@@ -34,17 +34,19 @@ func main() {
 	collectionsClient := qdrant.NewCollectionsClient(qdrantConn)
 	pointsClient := qdrant.NewPointsClient(qdrantConn)
 
-	testVector, err := embedder.GetEmbedding("test query")
+	testVector, err := embedder.GetEmbedding("cardiovascular disease treatment")
 	if err != nil {
 		log.Fatalf("Embedding service test failed: %v", err)
 	}
-	fmt.Printf("Embedding service connected. Vector size: %d\n", len(testVector))
+	vectorSize := len(testVector)
+
+	fmt.Printf("Embedding service connected. Vector size: %d\n", vectorSize)
 
 	_, err = collectionsClient.Create(context.Background(), &qdrant.CreateCollection{
 		CollectionName: "medical_abstracts",
 		VectorsConfig: &qdrant.VectorsConfig{Config: &qdrant.VectorsConfig_Params{
 			Params: &qdrant.VectorParams{
-				Size:     uint64(len(testVector)), // Use actual dimension later
+				Size:     uint64(vectorSize), // Use actual dimension later
 				Distance: qdrant.Distance_Cosine,
 			},
 		}},
@@ -62,7 +64,9 @@ func main() {
 
 	decoder := json.NewDecoder(file)
 	var points []*qdrant.PointStruct
-	batchSize := 50
+	batchSize := 2
+	processed := 0
+	batchCount := 0
 
 	for decoder.More() {
 		var doc Document
@@ -73,9 +77,16 @@ func main() {
 
 		textToEmbed := doc.Title + " " + doc.Abstract
 		vector, err := embedder.GetEmbedding(textToEmbed)
+
 		if err != nil {
 			log.Printf("Error creating embedding for doc %s: %v", doc.ID, err)
 			continue
+		}
+		// Verify vector dimension matches our collection
+		if len(vector) != vectorSize {
+			log.Printf("Warning: Vector dimension mismatch for doc %s. Expected %d, got %d",
+				doc.ID, vectorSize, len(vector))
+			// Continue anyway, but this might cause issues
 		}
 
 		// Point building
@@ -94,20 +105,31 @@ func main() {
 				"doi":            {Kind: &qdrant.Value_StringValue{StringValue: doc.DOI}},
 			},
 		}
+
 		points = append(points, point)
+		processed++
 
 		if len(points) >= batchSize {
+			batchCount++
+			fmt.Printf("Uploading batch %d with %d points...\n", batchCount, len(points))
+
 			if err := uploadBatch(pointsClient, points); err != nil {
 				log.Printf("Batch upload failed: %v", err)
+			} else {
+				fmt.Printf("Processed %d documents...\n", processed)
 			}
-			points = points[:0]
-			fmt.Print(".") // Show some progress
+			points = points[:0] // Clear the slice
 		}
 	}
 
 	if len(points) > 0 {
+		batchCount++
+		fmt.Printf("Uploading final batch %d with %d points...\n", batchCount, len(points))
+
 		if err := uploadBatch(pointsClient, points); err != nil {
 			log.Printf("Final batch upload failed: %v", err)
+		} else {
+			fmt.Printf("Successfully uploaded final batch %d\n", batchCount)
 		}
 	}
 	log.Println("\nIndexing complete!")
@@ -122,8 +144,25 @@ func uploadBatch(client qdrant.PointsClient, points []*qdrant.PointStruct) error
 	return err
 }
 
-func parseID(id string) uint64 {
+func parseID(idStr string) uint64 {
+	// Simple implementation - in production, use a proper ID scheme
 	var idNum uint64
-	fmt.Scanf(id, "%d", &idNum)
+	_, err := fmt.Sscanf(idStr, "%d", &idNum)
+	if err != nil {
+		// If ID is not numeric, create a hash-based ID
+		hash := fnvHash(idStr)
+		return hash
+	}
 	return idNum
+}
+
+func fnvHash(s string) uint64 {
+	// Simple FNV hash for string IDs
+	const prime uint64 = 1099511628211
+	hash := uint64(14695981039346656037)
+	for i := 0; i < len(s); i++ {
+		hash ^= uint64(s[i])
+		hash *= prime
+	}
+	return hash
 }
