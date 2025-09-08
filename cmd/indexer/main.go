@@ -56,7 +56,7 @@ func main() {
 		log.Printf("Collection creation error (might exist): %v", err)
 	}
 
-	file, err := os.Open("data/sample_data.jsonl")
+	file, err := os.Open("data/pubmed_real_articles.jsonl")
 	if err != nil {
 		log.Fatal(err)
 	}
