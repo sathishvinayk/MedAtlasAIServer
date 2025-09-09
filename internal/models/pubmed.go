@@ -78,6 +78,8 @@ type MedicalArticle struct {
 	MeshHeadings     []string  `json:"mesh_headings"`
 	PublicationTypes []string  `json:"publication_types"`
 	Affiliation      string    `json:"affiliation"`
+	KeyConcepts      []string  `json:"key_concepts,omitempty"` // Now used!
+	HasMedicalTerms  bool      `json:"has_medical_terms"`
 }
 
 type Author struct {
