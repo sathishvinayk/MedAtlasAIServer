@@ -1,4 +1,4 @@
-package embeddingclient
+package embeddingClient
 
 import (
 	"bytes"
