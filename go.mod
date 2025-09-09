@@ -6,6 +6,7 @@ require google.golang.org/grpc v1.75.0
 
 require (
 	github.com/gorilla/mux v1.8.1
+	github.com/grokify/html-strip-tags-go v0.1.0
 	github.com/qdrant/go-client v1.15.2
 	golang.org/x/net v0.41.0 // indirect
 	golang.org/x/sys v0.33.0 // indirect
