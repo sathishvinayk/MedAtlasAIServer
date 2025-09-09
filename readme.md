@@ -14,35 +14,6 @@ A high-performance, scalable backend for a semantic search engine specialized in
 - **Web Interface**: Simple responsive web UI for searching and browsing
 - **Biomedical Optimized**: Pre-configured with models trained on scientific and medical text
 
-## 🏗️ Architecture
-medical-search-backend/
-├── cmd/
-│ ├── api/ # Main HTTP API server (Go)
-│ ├── indexer/ # Data ingestion service (Go)
-│ └── verify/ # Data verification tool (Go)
-├── internal/
-│ ├── embeddingclient/ # Client for Python embedding service
-│ └── models/ # Data structures
-├── pkg/
-│ ├── data/ # Data processing and PubMed client
-│ ├── search/ # Advanced search functionality
-│ ├── cache/ # Caching layer (future)
-│ └── auth/ # Authentication (future)
-├── scripts/
-│ └── data_sources/ # Data collection scripts
-├── web/
-│ ├── templates/ # HTML templates
-│ └── static/ # CSS/JS assets
-├── data/
-│ ├── raw/ # Raw collected data
-│ ├── processed/ # Processed data
-│ └── backups/ # Data backups
-├── docker-compose.yml # Multi-container orchestration
-├── Dockerfile.api # Go API container definition
-├── Dockerfile.embedder # Python service container definition
-└── README.md
-
-
 ## 🛠️ Technology Stack
 
 ### Backend Services
