@@ -181,6 +181,15 @@ func processFile(ctx context.Context, filename string, embedder *embeddingClient
 		article.Abstract = data.CleanMedicalText(article.Abstract)
 		article.Abstract = data.NormalizeMedicalTerms(article.Abstract)
 
+		// ENHANCE: Extract medical concepts and detect medical terminology
+		article = *data.EnhanceArticle(&article)
+
+		// Only process if it contains medical content
+		if !article.HasMedicalTerms {
+			log.Printf("⚠️  Skipping non-medical article: %s", article.ID)
+			continue
+		}
+
 		// Validate after cleaning
 		if valid, reason := data.ValidateArticleWithReason(article); !valid {
 			log.Printf("⚠️  Skipping article %s: %s", article.ID, reason)
@@ -221,6 +230,17 @@ func processFile(ctx context.Context, filename string, embedder *embeddingClient
 				Kind: &qdrant.Value_ListValue{
 					ListValue: &qdrant.ListValue{
 						Values: convertToValueList(article.MeshHeadings),
+					},
+				},
+			}
+		}
+
+		// Add key concepts if available
+		if len(article.KeyConcepts) > 0 {
+			payload["key_concepts"] = &qdrant.Value{
+				Kind: &qdrant.Value_ListValue{
+					ListValue: &qdrant.ListValue{
+						Values: convertToValueList(article.KeyConcepts),
 					},
 				},
 			}

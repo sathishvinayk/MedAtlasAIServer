@@ -160,6 +160,20 @@ func NormalizeMedicalTerms(text string) string {
 	return text
 }
 
+// EnhanceArticle extracts key concepts and detects medical terminology
+func EnhanceArticle(article *models.MedicalArticle) *models.MedicalArticle {
+	if article == nil {
+		return nil
+	}
+
+	// Extract key medical concepts from title and abstract
+	fullText := article.Title + " " + article.Abstract
+	article.KeyConcepts = ExtractKeyConcepts(fullText)
+	article.HasMedicalTerms = ContainsMedicalTerm(fullText)
+
+	return article
+}
+
 // ValidateArticle checks if an article meets quality standards
 func ValidateArticle(article models.MedicalArticle) bool {
 	// Check absolutely required fields
@@ -275,81 +289,55 @@ func ExtractKeyConcepts(text string) []string {
 		return nil
 	}
 
-	words := strings.Fields(text)
-	var concepts []string
-
 	// Comprehensive medical terminology dictionary
 	medicalTerms := map[string]bool{
-		// General Medical Terms
-		"patient": true, "treatment": true, "therapy": true, "diagnosis": true,
-		"prognosis": true, "symptoms": true, "clinical": true, "medical": true,
-		"health": true, "disease": true, "disorder": true, "syndrome": true,
-		"condition": true, "illness": true, "infection": true, "inflammatory": true,
-		"chronic": true, "acute": true, "severe": true, "mild": true, "moderate": true,
+		// Diseases and Conditions
+		"diabetes": true, "cancer": true, "hypertension": true, "arthritis": true,
+		"asthma": true, "migraine": true, "depression": true, "anxiety": true,
+		"osteoporosis": true, "alzheimer": true, "parkinson": true,
+		"epilepsy": true, "schizophrenia": true, "fibromyalgia": true, "lupus": true,
+		"multiple sclerosis": true, "crohn": true, "colitis": true, "hepatitis": true,
+		"hiv": true, "aids": true, "tuberculosis": true, "malaria": true,
+		"pneumonia": true, "bronchitis": true, "emphysema": true, "copd": true,
 
-		// Body Systems
-		"cardiac": true, "cardiovascular": true, "pulmonary": true, "respiratory": true,
-		"neurological": true, "nervous": true, "gastrointestinal": true, "digestive": true,
-		"hepatic": true, "renal": true, "urinary": true, "reproductive": true,
-		"endocrine": true, "metabolic": true, "musculoskeletal": true, "hematological": true,
-		"immunological": true, "dermatological": true, "ophthalmological": true,
-		"otolaryngological": true, "psychiatric": true, "psychological": true,
+		// Symptoms
+		"pain": true, "fever": true, "fatigue": true, "nausea": true, "vomiting": true,
+		"headache": true, "dizziness": true, "rash": true, "swelling": true,
+		"inflammation": true, "bleeding": true, "shortness of breath": true,
+		"chest pain": true, "palpitations": true, "numbness": true, "weakness": true,
+
+		// Treatments and Procedures
+		"surgery": true, "chemotherapy": true, "radiotherapy": true, "immunotherapy": true,
+		"medication": true, "antibiotics": true, "antiviral": true, "antifungal": true,
+		"vaccine": true, "transplant": true, "dialysis": true, "biopsy": true,
+		"endoscopy": true, "colonoscopy": true, "mri": true, "ct scan": true,
+		"x-ray": true, "ultrasound": true, "blood test": true, "genetic testing": true,
+
+		// Body Systems and Anatomy
+		"cardiac": true, "pulmonary": true, "neurological": true, "gastrointestinal": true,
+		"renal": true, "hepatic": true, "endocrine": true, "musculoskeletal": true,
+		"dermatological": true, "ophthalmological": true, "otolaryngological": true,
+		"psychological": true, "immunological": true, "hematological": true,
 
 		// Medical Specialties
 		"oncology": true, "cardiology": true, "neurology": true, "psychiatry": true,
-		"pediatrics": true, "geriatrics": true, "surgery": true, "radiology": true,
+		"pediatrics": true, "geriatrics": true, "radiology": true,
 		"pathology": true, "pharmacology": true, "epidemiology": true, "toxicology": true,
-		"anesthesiology": true, "dermatology": true, "endocrinology": true, "gastroenterology": true,
-		"hematology": true, "nephrology": true, "pulmonology": true, "rheumatology": true,
-		"urology": true, "ophthalmology": true, "otolaryngology": true, "orthopedics": true,
-
-		// Treatments and Procedures
-		"medication": true, "drug": true, "pharmaceutical": true,
-		"procedure": true, "operation": true, "transplant": true, "transplantation": true,
-		"biopsy": true, "resection": true, "excision": true, "incision": true,
-		"drainage": true, "aspiration": true, "injection": true, "infusion": true,
-		"transfusion": true, "dialysis": true, "ventilation": true, "resuscitation": true,
-		"rehabilitation": true, "chemotherapy": true, "radiotherapy": true,
-		"immunotherapy": true, "targeted": true, "biological": true, "vaccine": true,
-		"antibiotic": true, "antiviral": true, "antifungal": true, "antiinflammatory": true,
-
-		// Diagnostic Terms
-		"screening": true, "detection": true, "monitoring": true,
-		"assessment": true, "evaluation": true, "examination": true, "test": true,
-		"assay": true, "biomarker": true, "marker": true, "indicator": true,
-		"sign": true, "symptom": true, "finding": true, "result": true,
-		"positive": true, "negative": true, "abnormal": true, "normal": true,
-		"elevated": true, "reduced": true, "increased": true, "decreased": true,
-
-		// Research Terms
-		"study": true, "trial": true, "research": true, "investigation": true,
-		"analysis": true, "observation": true,
-		"experiment": true, "randomized": true, "controlled": true,
-		"prospective": true, "retrospective": true, "cohort": true, "case": true,
-		"control": true, "cross-sectional": true, "longitudinal": true, "meta-analysis": true,
-		"systematic": true, "review": true, "literature": true, "evidence": true,
-		"data": true, "results": true, "findings": true, "conclusion": true,
-		"significance": true, "correlation": true, "association": true, "risk": true,
-		"factor": true, "predictor": true, "outcome": true, "mortality": true,
-		"morbidity": true, "survival": true, "recurrence": true, "progression": true,
-		"response": true, "efficacy": true, "safety": true, "tolerability": true,
-		"adverse": true, "event": true, "side": true, "effect": true,
-		"complication": true, "toxicity": true, "interaction": true, "contraindication": true,
-
-		// Statistical Terms
-		"statistical": true, "method": true, "model": true,
-		"regression": true, "value": true,
-		"confidence": true, "interval": true, "odds": true, "ratio": true,
-		"hazard": true, "adjusted": true, "multivariate": true,
-		"univariate": true, "sensitivity": true, "specificity": true, "accuracy": true,
-		"precision": true, "recall": true, "auc": true, "roc": true,
+		"dermatology": true, "endocrinology": true, "gastroenterology": true,
+		"nephrology": true, "pulmonology": true, "rheumatology": true, "urology": true,
 	}
+
+	words := strings.Fields(text)
+	var concepts []string
+	seen := make(map[string]bool)
 
 	for _, word := range words {
 		cleanWord := strings.ToLower(strings.Trim(word, ".,!?;:\"'()[]{}"))
-		if len(cleanWord) > 3 && medicalTerms[cleanWord] {
-			// Preserve original case for display
-			concepts = append(concepts, word)
+
+		// Check for multi-word concepts first
+		if len(cleanWord) > 3 && medicalTerms[cleanWord] && !seen[cleanWord] {
+			concepts = append(concepts, word) // Preserve original case
+			seen[cleanWord] = true
 		}
 	}
 
@@ -434,12 +422,30 @@ func IsRecentArticle(publishedDate time.Time, years int) bool {
 	return time.Since(publishedDate) <= time.Duration(years)*365*24*time.Hour
 }
 
-// ContainsMedicalTerm checks if text contains medical terminology
+// ContainsMedicalTerm checks if text contains medical terminology - NOW USED!
 func ContainsMedicalTerm(text string) bool {
+	if text == "" {
+		return false
+	}
+
 	medicalIndicators := []string{
+		// Medical conditions
 		"patient", "treatment", "therapy", "diagnosis", "clinical", "medical",
 		"disease", "symptom", "procedure", "surgery", "medication", "drug",
 		"hospital", "clinic", "doctor", "physician", "nurse", "health",
+		"illness", "disorder", "syndrome", "infection", "inflammatory",
+
+		// Body systems
+		"cardiac", "pulmonary", "neurological", "gastrointestinal", "renal",
+		"hepatic", "endocrine", "musculoskeletal", "dermatological",
+
+		// Medical procedures
+		"operation", "transplant", "biopsy", "scan", "test", "imaging",
+		"injection", "infusion", "transfusion", "dialysis",
+
+		// Medications
+		"antibiotic", "antiviral", "antifungal", "anti-inflammatory",
+		"analgesic", "antidepressant", "antipsychotic", "vaccine",
 	}
 
 	lowerText := strings.ToLower(text)
@@ -448,6 +454,112 @@ func ContainsMedicalTerm(text string) bool {
 			return true
 		}
 	}
+
+	return false
+}
+
+// ExtractMedicalEntities extracts structured medical information - NEW!
+func ExtractMedicalEntities(text string) map[string][]string {
+	entities := map[string][]string{
+		"conditions":  {},
+		"symptoms":    {},
+		"treatments":  {},
+		"procedures":  {},
+		"medications": {},
+		"body_parts":  {},
+	}
+
+	// Simple pattern matching for entity extraction
+	patterns := map[string][]string{
+		"conditions": {
+			`\b(diabetes|hypertension|arthritis|asthma|cancer|migraine|depression|anxiety)\b`,
+			`\b(heart disease|lung disease|kidney disease|liver disease)\b`,
+			`\b(alzheimer|parkinson|epilepsy|schizophrenia|fibromyalgia|lupus)\b`,
+		},
+		"symptoms": {
+			`\b(pain|fever|fatigue|nausea|headache|dizziness|rash|swelling)\b`,
+			`\b(shortness of breath|chest pain|palpitations|numbness|weakness)\b`,
+		},
+		"treatments": {
+			`\b(surgery|chemotherapy|radiotherapy|immunotherapy|medication)\b`,
+			`\b(physical therapy|occupational therapy|speech therapy)\b`,
+		},
+		"medications": {
+			`\b(antibiotic|antiviral|antifungal|anti-inflammatory|analgesic)\b`,
+			`\b(antidepressant|antipsychotic|vaccine|insulin|metformin)\b`,
+		},
+	}
+
+	for entityType, regexPatterns := range patterns {
+		for _, pattern := range regexPatterns {
+			re := regexp.MustCompile(pattern)
+			matches := re.FindAllString(text, -1)
+			entities[entityType] = append(entities[entityType], matches...)
+		}
+		entities[entityType] = removeDuplicates(entities[entityType])
+	}
+
+	return entities
+}
+
+// CalculateMedicalRelevance scores how medical a text is - NEW!
+func CalculateMedicalRelevance(text string) float64 {
+	if text == "" {
+		return 0.0
+	}
+
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return 0.0
+	}
+
+	medicalWords := 0
+	medicalTerms := []string{
+		"patient", "treatment", "diagnosis", "symptom", "disease",
+		"therapy", "clinical", "medical", "hospital", "doctor",
+		"medication", "surgery", "procedure", "test", "scan",
+	}
+
+	lowerText := strings.ToLower(text)
+	for _, term := range medicalTerms {
+		if strings.Contains(lowerText, term) {
+			medicalWords++
+		}
+	}
+
+	// Calculate ratio of medical terms to total words
+	return float64(medicalWords) / float64(len(words))
+}
+
+// IsClinicalStudy checks if article appears to be a clinical study - NEW!
+func IsClinicalStudy(article models.MedicalArticle) bool {
+	// Check publication types
+	clinicalTypes := []string{
+		"Clinical Trial", "Randomized Controlled Trial", "Clinical Study",
+		"Case Report", "Case Series", "Observational Study",
+	}
+
+	for _, pubType := range article.PublicationTypes {
+		for _, clinicalType := range clinicalTypes {
+			if strings.EqualFold(pubType, clinicalType) {
+				return true
+			}
+		}
+	}
+
+	// Check abstract for clinical indicators
+	abstract := strings.ToLower(article.Abstract)
+	clinicalIndicators := []string{
+		"clinical trial", "randomized", "controlled study", "patient cohort",
+		"treatment group", "placebo", "double-blind", "follow-up",
+	}
+
+	for _, indicator := range clinicalIndicators {
+		if strings.Contains(abstract, indicator) {
+			return true
+		}
+	}
+
 	return false
 }
 
