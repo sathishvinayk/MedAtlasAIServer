@@ -88,7 +88,7 @@ func (mc *MedicalChat) SearchMedicalKnowledge(ctx context.Context, query string,
 	searchResult, err := mc.QdrantClient.Search(ctx, &qdrant.SearchPoints{
 		CollectionName: "medical_abstracts",
 		Vector:         vector,
-		Limit:          2, // Fewer, more focused results for chat
+		Limit:          1, // Fewer, more focused results for chat
 		WithPayload: &qdrant.WithPayloadSelector{
 			SelectorOptions: &qdrant.WithPayloadSelector_Include{
 				Include: &qdrant.PayloadIncludeSelector{
