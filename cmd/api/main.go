@@ -2,6 +2,7 @@ package main
 
 import (
 	"MedAtlasAIServer/internal/embeddingClient"
+	"MedAtlasAIServer/internal/models"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -146,6 +147,26 @@ func (s *Server) readyHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) processAudioHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var audioReq models.ProcessAudioRequest
+	if err := json.NewDecoder(r.Body).Decode(&audioReq); err != nil {
+		http.Error(w, `{"error": "Invlalid json"}`, http.StatusBadRequest)
+		return
+	}
+
+	aiResult, err := s.Embedder.ProcessAudio(&audioReq)
+	if err != nil {
+		log.Printf("AI service error: %v", err)
+		http.Error(w, `{"error": "Error processing audio"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(aiResult)
+}
+
 func main() {
 	embeddedHost := os.Getenv("EMBEDDING_SERVICE_HOST")
 	if embeddedHost == "" { //Keep localhost for now
@@ -174,6 +195,8 @@ func main() {
 	r.HandleFunc("/search", server.searchHandler).Methods("POST")
 	r.HandleFunc("/health", server.healthHandler).Methods("GET")
 	r.HandleFunc("/ready", server.readyHandler).Methods("GET")
+
+	r.HandleFunc("/process-audio", server.processAudioHandler).Methods("POST", "OPTIONS")
 
 	port := os.Getenv("PORT")
 	if port == "" {
