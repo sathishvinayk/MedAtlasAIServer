@@ -1,3 +1,24 @@
+"""
+Purpose: Perform the machine learning magic.
+
+Service: asr-service (Automatic Speech Recognition)
+API: POST /transcribe
+Input: Audio file or stream.
+Output: Raw transcript with speaker diarization.
+Technology: A fine-tuned OpenAI Whisper model or a custom model running on NVIDIA Riva, hosted on a GPU-enabled cloud instance.
+
+Service: clinical-nlu-service (Natural Language Understanding)
+API: POST /analyze
+Input: Raw transcript.
+Output: Structured JSON of extracted medical entities (symptoms, medications, diagnoses) and their relationships.
+Technology: Python (PyTorch/TensorFlow), using a fine-tuned BioBERT or ClinicalBERT model from Hugging Face.
+
+Service: note-assembly-service
+API: POST /generate-note
+Input: Structured medical entities + original transcript.
+Output: A fully formatted clinical note (e.g., in SOAP format).
+Technology: Could be a rules-based templating engine or a specialized LLM (like Llama 3 or a fine-tuned GPT) prompted specifically for this task.
+"""
 # Components together for a basic prototype:
 # User records audio in your web app.
 # backend sends the audio file to a self-hosted Whisper model.
@@ -9,7 +30,14 @@
 # a) Use a rule-based system to template it into a note: "Patient complains of [SYMPTOM]."
 # b) Send it to a smaller, self-hosted LLM (like a fine-tuned Mistral 7B) with a prompt: "Convert these medical entities into a clinical assessment paragraph: [ENTITIES]"
 # The final note is presented to the user.
-
+"""
+curl -X POST http://localhost:8080/process-audio \           
+  -H "Content-Type: application/json" \
+  -d "{
+    \"audio_data\": \"$(base64 -i doctor_patient_conversation.mp3 | tr -d '\n')\",
+    \"file_name\": \"doctor_patient_conversation.mp3\"
+  }"
+"""
 # ASR -> NLU -> SOAP
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
