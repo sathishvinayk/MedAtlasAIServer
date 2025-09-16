@@ -56,6 +56,13 @@ from threading import Lock
 from contextlib import asynccontextmanager
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+import torch
+from transformers import (
+    AutoTokenizer, 
+    AutoModelForCausalLM, 
+    GenerationConfig,
+    BitsAndBytesConfig
+)
 
 # Lifespan management
 @asynccontextmanager
@@ -67,9 +74,9 @@ async def lifespan(app: FastAPI):
     await cleanup_models()
 
 app = FastAPI(
-    title="Medical Embedding Service",
-    description="API for medical audio processing, transcription, and entity extraction",
-    version="1.0.0",
+    title="Medical NLP Service",
+    description="API for medical audio processing, transcription, and SOAP note generation with fine-tuned LLMs",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -88,38 +95,45 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("medical-embedding-service")
+logger = logging.getLogger("medical-nlp-service")
 
 # Global models (loaded asynchronously)
 SENTENCE_MODEL = None
 WHISPER_MODEL = None
 BIOBERT_MODEL = None
 SPACY_MODEL = None
+MEDICAL_LLM = None
+MEDICAL_TOKENIZER = None
 
-# Thread pools for each model type - configurable via environment variables
+# Thread pools for each model type
 MAX_WORKERS_BIOBERT = int(os.getenv('MAX_WORKERS_BIOBERT', '2'))
 MAX_WORKERS_SPACY = int(os.getenv('MAX_WORKERS_SPACY', '2'))
 MAX_WORKERS_WHISPER = int(os.getenv('MAX_WORKERS_WHISPER', '1'))
 MAX_WORKERS_SENTENCE = int(os.getenv('MAX_WORKERS_SENTENCE', '2'))
 MAX_WORKERS_GENERAL = int(os.getenv('MAX_WORKERS_GENERAL', '4'))
+MAX_WORKERS_LLM = int(os.getenv('MAX_WORKERS_LLM', '1'))  # LLM is memory-intensive
 
 SENTENCE_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_SENTENCE, thread_name_prefix="sentence_")
 WHISPER_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_WHISPER, thread_name_prefix="whisper_")
 BIOBERT_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_BIOBERT, thread_name_prefix="biobert_")
 SPACY_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_SPACY, thread_name_prefix="spacy_")
 GENERAL_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_GENERAL, thread_name_prefix="general_")
+LLM_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_LLM, thread_name_prefix="llm_")
 
 # Thread safety
 _biobert_lock = Lock()
 _spacy_lock = Lock()
-_model_load_lock = Lock()  # Lock for model loading
+_llm_lock = Lock()
+_model_load_lock = Lock()
 _models_loaded = False
 
 # Configuration
 MAX_AUDIO_BYTES = 10 * 1024 * 1024  # 10MB
 WHISPER_MODEL_SIZE = "base"
+MEDICAL_LLM_NAME = os.getenv('MEDICAL_LLM_NAME', 'microsoft/BioGPT-Large')
+# Alternatives: 'mistralai/Mistral-7B-v0.1', 'microsoft/BioGPT-Large', 'stanford-crfm/BioMedLM'
 
-# Medical keywords and patterns
+# Medical keywords and patterns (unchanged)
 MEDICAL_KEYWORDS = {
     "SYMPTOM": ["headache", "fever", "cough", "pain", "nausea", "dizziness", 
                 "fatigue", "tired", "tiredness", "shortness of breath", 
@@ -141,7 +155,7 @@ MEDICATION_SYNONYMS = {
     "motrin": "ibuprofen"
 }
 
-# Pydantic Models
+# Pydantic Models (unchanged)
 class MedicalEntity(BaseModel):
     entity: str = Field(..., description="Type of medical entity (SYMPTOM, MEDICATION, etc.)")
     text: str = Field(..., description="The actual text of the entity")
@@ -163,7 +177,6 @@ class ProcessAudioRequest(BaseModel):
 
     @validator('file_name')
     def validate_file_name(cls, v):
-        """Validate filename pattern"""
         if not re.match(r'^[\w\s\-\.]+$', v):
             raise ValueError('Filename contains invalid characters')
         return v
@@ -171,7 +184,6 @@ class ProcessAudioRequest(BaseModel):
     @validator('audio_data')
     def validate_audio_data(cls, v):
         try:
-            # Validate base64 and check size
             decoded = base64.b64decode(v, validate=True)
             if len(decoded) > MAX_AUDIO_BYTES:
                 raise ValueError(f"Audio data exceeds maximum size of {MAX_AUDIO_BYTES} bytes")
@@ -187,11 +199,11 @@ class ProcessAudioResponse(BaseModel):
     error: Optional[str] = Field(None, description="Error message if any")
     model_used: str = Field("", description="ASR model used")
     nlu_model_used: str = Field("", description="NLU model used")
+    llm_model_used: str = Field("", description="LLM model used for SOAP generation")
     request_id: str = Field(..., description="Unique request identifier")
 
-# Utility functions
+# Utility functions (unchanged except for SOAP generation)
 def normalize_medication_name(text: str) -> str:
-    """Normalize medication names to standard terms"""
     lower_text = text.lower()
     for synonym, standard in MEDICATION_SYNONYMS.items():
         if synonym in lower_text:
@@ -199,38 +211,32 @@ def normalize_medication_name(text: str) -> str:
     return text
 
 def truncate_text(text: str, max_length: int) -> str:
-    """Truncate text for readability"""
     if len(text) <= max_length:
         return text
     return text[:max_length] + "..."
 
 def deduplicate_entities(entities: List[MedicalEntity]) -> List[MedicalEntity]:
-    """Better deduplication that handles overlapping spans by preferring longest match"""
     if not entities:
         return []
     
-    # Sort by start position and then by length (longest first)
     entities.sort(key=lambda x: (x.start, -(x.end - x.start)))
     
     unique_entities = []
     seen_positions = set()
     
     for entity in entities:
-        # Check if this entity overlaps with any already selected entity
         overlapping = False
         for selected in unique_entities:
             if (entity.start < selected.end and entity.end > selected.start):
                 overlapping = True
                 break
         
-        # Only add if it doesn't overlap with any already selected entity
         if not overlapping:
             unique_entities.append(entity)
     
     return unique_entities
 
 def universal_embedding(text: str, dimensions: int = 384) -> List[float]:
-    """Deterministic fallback embedding"""
     text_hash = hashlib.sha256(text.encode()).hexdigest()
     seed = int(text_hash[:8], 16)
     
@@ -244,7 +250,6 @@ def universal_embedding(text: str, dimensions: int = 384) -> List[float]:
     return embedding.tolist()
 
 def universal_transcript(audio_path: str) -> str:
-    """Fallback transcription for testing"""
     with open(audio_path, "rb") as f:
         audio_hash = hashlib.sha256(f.read()).hexdigest()
     
@@ -259,9 +264,8 @@ def universal_transcript(audio_path: str) -> str:
 
     return f"Patient presents with {' and '.join(random_symptoms)}. Currently taking {random_med}. Denies other symptoms. Vital signs stable."
 
-# Model mapping functions
+# Model mapping functions (unchanged)
 def map_biobert_label_to_medical(label: str, token_text: str) -> str:
-    """Map BioBERT labels to medical categories"""
     label_upper = label.upper()
     
     if any(x in label_upper for x in ["DISEASE", "DIAG", "CONDITION"]):
@@ -273,7 +277,6 @@ def map_biobert_label_to_medical(label: str, token_text: str) -> str:
     if any(x in label_upper for x in ["ANATOMY", "BODY", "LOC"]):
         return "BODY_PART"
     
-    # Fallback to keyword matching
     token_lower = token_text.lower()
     for ent_type, keywords in MEDICAL_KEYWORDS.items():
         if token_lower in keywords:
@@ -282,7 +285,6 @@ def map_biobert_label_to_medical(label: str, token_text: str) -> str:
     return "OTHER"
 
 def map_spacy_label_to_medical(label: str) -> str:
-    """Map spaCy labels to medical categories"""
     mapping = {
         "DISEASE": "DIAGNOSIS",
         "CONDITION": "DIAGNOSIS",
@@ -297,9 +299,8 @@ def map_spacy_label_to_medical(label: str) -> str:
     }
     return mapping.get(label, "OTHER")
 
-# Keyword-based entity extraction
+# Keyword-based entity extraction (unchanged)
 def extract_entities_keywords(text: str) -> List[MedicalEntity]:
-    """Improved keyword extraction without duplicates"""
     entities = []
     text_lower = text.lower()
     matched_positions = set()
@@ -310,12 +311,11 @@ def extract_entities_keywords(text: str) -> List[MedicalEntity]:
             for match in re.finditer(pattern, text_lower):
                 start, end = match.start(), match.end()
                 
-                # Check if this position is already covered
                 position_key = (start, end)
                 if position_key not in matched_positions:
                     entities.append(MedicalEntity(
                         entity=entity_type,
-                        text=text[start:end],  # Preserve original case
+                        text=text[start:end],
                         start=start,
                         end=end,
                         confidence=0.8
@@ -324,22 +324,19 @@ def extract_entities_keywords(text: str) -> List[MedicalEntity]:
     
     return entities
 
-# Load spaCy with EntityRuler
+# Load spaCy with EntityRuler (unchanged)
 def load_spacy_with_ruler():
-    """Load spaCy model with EntityRuler for medical patterns"""
     try:
         import spacy
         from spacy.pipeline import EntityRuler
         
         nlp = spacy.load("en_core_web_sm")
         
-        # Create patterns for medical entities
         patterns = []
         for label, keywords in MEDICAL_KEYWORDS.items():
             for keyword in keywords:
                 patterns.append({"label": label, "pattern": [{"LOWER": keyword.lower()}]})
         
-        # Add entity ruler
         ruler = nlp.add_pipe("entity_ruler", before="ner")
         ruler.add_patterns(patterns)
         
@@ -349,22 +346,20 @@ def load_spacy_with_ruler():
         logger.warning(f"spaCy with EntityRuler failed: {e}")
         return None
 
-# Main entity extraction function
+# Main entity extraction function (unchanged)
 def extract_medical_entities_sync(text: str) -> Tuple[List[MedicalEntity], str]:
-    """Synchronous entity extraction (run in executor)"""
     entities = []
     model_used = "keyword-fallback"
     
     global BIOBERT_MODEL, SPACY_MODEL
     
-    # Try BioBERT first
     if BIOBERT_MODEL is not None:
         try:
-            with _biobert_lock:  # Use threading lock for short sync operations
+            with _biobert_lock:
                 results = BIOBERT_MODEL(text)
             
             for entity in results:
-                if entity.get('score', 0) > 0.6:  # Confidence threshold
+                if entity.get('score', 0) > 0.6:
                     entity_type = map_biobert_label_to_medical(
                         entity.get('entity_group', ''),
                         entity.get('word', '')
@@ -386,10 +381,9 @@ def extract_medical_entities_sync(text: str) -> Tuple[List[MedicalEntity], str]:
         except Exception as e:
             logger.warning(f"BioBERT extraction failed: {e}")
     
-    # Try spaCy with medical patterns
     if SPACY_MODEL is not None:
         try:
-            with _spacy_lock:  # Use threading lock for short sync operations
+            with _spacy_lock:
                 doc = SPACY_MODEL(text)
             
             for ent in doc.ents:
@@ -411,20 +405,104 @@ def extract_medical_entities_sync(text: str) -> Tuple[List[MedicalEntity], str]:
         except Exception as e:
             logger.warning(f"spaCy extraction failed: {e}")
     
-    # Fallback to keyword matching
     entities = extract_entities_keywords(text)
     return entities, model_used
 
-# SOAP note generation
-def generate_soap_note(transcript: str, entities: List[MedicalEntity]) -> str:
-    """Generate clinical SOAP note"""
+# NEW: LLM-based SOAP note generation
+def generate_soap_note_llm(transcript: str, entities: List[MedicalEntity]) -> str:
+    """Generate SOAP note using fine-tuned medical LLM"""
+    global MEDICAL_LLM, MEDICAL_TOKENIZER
+    
+    if MEDICAL_LLM is None or MEDICAL_TOKENIZER is None:
+        logger.warning("Medical LLM not available, falling back to rule-based SOAP")
+        return generate_soap_note_rule_based(transcript, entities)
+    
+    try:
+        with _llm_lock:
+            # Prepare context from extracted entities
+            symptoms = sorted(set(e.text for e in entities if e.entity == "SYMPTOM"))
+            medications = sorted(set(
+                normalize_medication_name(e.text) 
+                for e in entities if e.entity == "MEDICATION"
+            ))
+            
+            # Construct prompt for medical LLM
+            prompt = f"""<s>[INST] <<SYS>>
+                You are a medical assistant trained to generate comprehensive SOAP notes from patient transcripts.
+                Generate a structured SOAP note following this format:
+
+                SUBJECTIVE:
+                - Patient's reported symptoms and concerns
+                - Relevant medical history from conversation
+
+                OBJECTIVE:
+                - Vital signs and physical exam findings (infer from context)
+                - Current medications mentioned
+
+                ASSESSMENT:
+                - Clinical assessment and differential diagnosis
+                - Connection between symptoms and medications
+
+                PLAN:
+                - Treatment recommendations
+                - Follow-up instructions
+                - Medication adjustments if needed
+
+                Keep the note professional, concise, and clinically accurate.
+                <</SYS>>
+
+                Patient Transcript: "{truncate_text(transcript, 1500)}"
+
+                Extracted Medical Information:
+                - Symptoms: {', '.join(symptoms) if symptoms else 'None reported'}
+                - Medications: {', '.join(medications) if medications else 'None reported'}
+
+                Please generate a comprehensive SOAP note based on this information. [/INST]"""
+            
+            # Tokenize and generate
+            inputs = MEDICAL_TOKENIZER(prompt, return_tensors="pt", truncation=True, max_length=2048)
+            
+            # Use GPU if available
+            if torch.cuda.is_available():
+                inputs = {k: v.to('cuda') for k, v in inputs.items()}
+            
+            # Generate response
+            with torch.no_grad():
+                outputs = MEDICAL_LLM.generate(
+                    **inputs,
+                    max_new_tokens=512,
+                    temperature=0.7,
+                    do_sample=True,
+                    top_p=0.9,
+                    pad_token_id=MEDICAL_TOKENIZER.eos_token_id,
+                    repetition_penalty=1.1
+                )
+            
+            # Decode and extract the generated text
+            generated_text = MEDICAL_TOKENIZER.decode(outputs[0], skip_special_tokens=True)
+            
+            # Extract only the assistant's response (after the instruction)
+            response = generated_text.split("[/INST]")[-1].strip()
+            
+            # Clean up any remaining special tokens
+            response = re.sub(r'<s>|</s>|\[INST\]|\[/INST\]', '', response).strip()
+            
+            return response
+            
+    except Exception as e:
+        logger.error(f"LLM SOAP generation failed: {e}")
+        # Fallback to rule-based
+        return generate_soap_note_rule_based(transcript, entities)
+
+# Fallback rule-based SOAP generation
+def generate_soap_note_rule_based(transcript: str, entities: List[MedicalEntity]) -> str:
+    """Rule-based SOAP note generation (fallback)"""
     symptoms = sorted(set(e.text for e in entities if e.entity == "SYMPTOM"))
     medications = sorted(set(
         normalize_medication_name(e.text) 
         for e in entities if e.entity == "MEDICATION"
     ))
     
-    # Clinical assessment logic
     symptom_lower = [s.lower() for s in symptoms]
     med_lower = [m.lower() for m in medications]
     
@@ -454,16 +532,15 @@ def generate_soap_note(transcript: str, entities: List[MedicalEntity]) -> str:
         1. Continue current medication regimen with monitoring
         2. Follow up on: {', '.join(symptoms) if symptoms else 'No specific symptoms to monitor'}
         3. Schedule follow-up appointment in 2-4 weeks
-        4. Patient instructed to report any worsening symptoms promptly
-        """
+        4. Patient instructed to report any worsening symptoms promptly"""
+    
     return soap_note.strip()
 
-# Model loading functions
+# Model loading functions (updated to include medical LLM)
 async def load_models_async():
-    """Asynchronously load all models"""
-    global SENTENCE_MODEL, WHISPER_MODEL, BIOBERT_MODEL, SPACY_MODEL, _models_loaded
+    """Asynchronously load all models including medical LLM"""
+    global SENTENCE_MODEL, WHISPER_MODEL, BIOBERT_MODEL, SPACY_MODEL, MEDICAL_LLM, MEDICAL_TOKENIZER, _models_loaded
     
-    # Use lock to prevent multiple concurrent loads
     with _model_load_lock:
         if _models_loaded:
             return
@@ -472,7 +549,6 @@ async def load_models_async():
         
         async def load_sentence_transformer():
             try:
-                # Offload blocking constructor to thread
                 def _load_st():
                     from sentence_transformers import SentenceTransformer
                     return SentenceTransformer('all-MiniLM-L6-v2')
@@ -488,7 +564,6 @@ async def load_models_async():
         
         async def load_whisper():
             try:
-                # Offload blocking constructor to thread
                 def _load_whisper():
                     import whisper
                     return whisper.load_model(WHISPER_MODEL_SIZE)
@@ -504,7 +579,6 @@ async def load_models_async():
         
         async def load_biobert():
             try:
-                # Offload blocking constructor to thread
                 def _load_biobert():
                     from transformers import pipeline
                     return pipeline(
@@ -525,7 +599,6 @@ async def load_models_async():
         
         async def load_spacy():
             try:
-                # Offload blocking constructor to thread
                 model = await asyncio.get_event_loop().run_in_executor(
                     GENERAL_POOL, load_spacy_with_ruler
                 )
@@ -534,25 +607,73 @@ async def load_models_async():
                 logger.warning(f"spaCy failed: {e}")
                 return None
         
+        async def load_medical_llm():
+            """Load fine-tuned medical LLM for SOAP generation"""
+            try:
+                def _load_llm():
+                    # Configure for efficient inference
+                    quantization_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.float16,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_use_double_quant=True,
+                    )
+                    
+                    # Load tokenizer and model
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        MEDICAL_LLM_NAME,
+                        trust_remote_code=True
+                    )
+                    
+                    model = AutoModelForCausalLM.from_pretrained(
+                        MEDICAL_LLM_NAME,
+                        quantization_config=quantization_config,
+                        device_map="auto",
+                        trust_remote_code=True,
+                        torch_dtype=torch.float16
+                    )
+                    
+                    # Set padding token if not present
+                    if tokenizer.pad_token is None:
+                        tokenizer.pad_token = tokenizer.eos_token
+                    
+                    return model, tokenizer
+                
+                model, tokenizer = await asyncio.get_event_loop().run_in_executor(
+                    LLM_POOL, _load_llm
+                )
+                logger.info(f"✓ Medical LLM ({MEDICAL_LLM_NAME}) loaded successfully")
+                return model, tokenizer
+            except Exception as e:
+                logger.warning(f"Medical LLM failed: {e}")
+                return None, None
+        
         # Load models concurrently
         results = await asyncio.gather(
             load_sentence_transformer(),
             load_whisper(),
             load_biobert(),
             load_spacy(),
+            load_medical_llm(),
             return_exceptions=True
         )
         
-        # Sanitize results - replace exceptions with None
+        # Sanitize results
         sanitized_results = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.error(f"Model loading failed with exception: {result}")
-                sanitized_results.append(None)
+                if i == 4:  # LLM result
+                    sanitized_results.append((None, None))
+                else:
+                    sanitized_results.append(None)
             else:
                 sanitized_results.append(result)
         
-        SENTENCE_MODEL, WHISPER_MODEL, BIOBERT_MODEL, SPACY_MODEL = sanitized_results
+        SENTENCE_MODEL, WHISPER_MODEL, BIOBERT_MODEL, SPACY_MODEL, llm_result = sanitized_results
+        if llm_result:
+            MEDICAL_LLM, MEDICAL_TOKENIZER = llm_result
+        
         _models_loaded = True
         logger.info("Model loading completed")
 
@@ -560,19 +681,28 @@ async def cleanup_models():
     """Cleanup model resources"""
     logger.info("Cleaning up models and thread pools...")
     
+    # Clear LLM memory if using GPU
+    global MEDICAL_LLM
+    if MEDICAL_LLM is not None and torch.cuda.is_available():
+        try:
+            MEDICAL_LLM = None
+            torch.cuda.empty_cache()
+        except Exception as e:
+            logger.warning(f"Failed to clear GPU memory: {e}")
+    
     # Shutdown thread pools
     SENTENCE_POOL.shutdown(wait=False)
     WHISPER_POOL.shutdown(wait=False)
     BIOBERT_POOL.shutdown(wait=False)
     SPACY_POOL.shutdown(wait=False)
     GENERAL_POOL.shutdown(wait=False)
+    LLM_POOL.shutdown(wait=False)
     
     logger.info("Thread pools shutdown completed")
 
-# Temporary file context manager
+# Temporary file context manager (unchanged)
 @asynccontextmanager
 async def temp_audio_file(audio_bytes: bytes):
-    """Context manager for temporary audio files"""
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
@@ -586,10 +716,10 @@ async def temp_audio_file(audio_bytes: bytes):
             except Exception as e:
                 logger.warning(f"Failed to delete temp file {temp_path}: {e}")
 
-# API Endpoints
+# API Endpoints (updated for LLM SOAP generation)
 @app.post("/process-audio", response_model=ProcessAudioResponse)
 async def process_audio(request: ProcessAudioRequest):
-    """Process audio data and return medical analysis"""
+    """Process audio data and return medical analysis with LLM-generated SOAP note"""
     request_id = str(uuid.uuid4())
     
     try:
@@ -599,10 +729,9 @@ async def process_audio(request: ProcessAudioRequest):
         audio_bytes = base64.b64decode(request.audio_data)
         
         async with temp_audio_file(audio_bytes) as audio_path:
-            # Transcription - use Whisper-specific thread pool
+            # Transcription
             if WHISPER_MODEL is not None:
                 try:
-                    # Run transcription in Whisper thread pool
                     result = await asyncio.get_event_loop().run_in_executor(
                         WHISPER_POOL, 
                         lambda: WHISPER_MODEL.transcribe(audio_path)
@@ -611,7 +740,6 @@ async def process_audio(request: ProcessAudioRequest):
                     asr_model_used = f"whisper-{WHISPER_MODEL_SIZE}"
                 except Exception as e:
                     logger.warning(f"Whisper transcription failed: {e}")
-                    # Fallback to universal transcript in general pool
                     transcript = await asyncio.get_event_loop().run_in_executor(
                         GENERAL_POOL, 
                         universal_transcript, audio_path
@@ -624,28 +752,39 @@ async def process_audio(request: ProcessAudioRequest):
                 )
                 asr_model_used = "universal-fallback"
             
-            # Entity extraction - use appropriate thread pool based on model availability
+            # Entity extraction
             if BIOBERT_MODEL is not None:
-                # Use BioBERT pool for entity extraction
                 entities, nlu_model_used = await asyncio.get_event_loop().run_in_executor(
                     BIOBERT_POOL, 
                     extract_medical_entities_sync, transcript
                 )
             elif SPACY_MODEL is not None:
-                # Use spaCy pool for entity extraction
                 entities, nlu_model_used = await asyncio.get_event_loop().run_in_executor(
                     SPACY_POOL, 
                     extract_medical_entities_sync, transcript
                 )
             else:
-                # Fallback to general pool
                 entities, nlu_model_used = await asyncio.get_event_loop().run_in_executor(
                     GENERAL_POOL, 
                     extract_medical_entities_sync, transcript
                 )
             
-            # SOAP note generation - run inline since it's CPU-light
-            soap_note = generate_soap_note(transcript, entities)
+            # SOAP note generation with LLM
+            llm_model_used = "none"
+            if MEDICAL_LLM is not None:
+                try:
+                    soap_note = await asyncio.get_event_loop().run_in_executor(
+                        LLM_POOL, 
+                        generate_soap_note_llm, transcript, entities
+                    )
+                    llm_model_used = MEDICAL_LLM_NAME
+                except Exception as e:
+                    logger.error(f"LLM SOAP generation failed: {e}")
+                    soap_note = generate_soap_note_rule_based(transcript, entities)
+                    llm_model_used = "rule-based-fallback"
+            else:
+                soap_note = generate_soap_note_rule_based(transcript, entities)
+                llm_model_used = "rule-based"
             
             logger.info(f"Request {request_id} completed successfully")
             
@@ -656,6 +795,7 @@ async def process_audio(request: ProcessAudioRequest):
                 soap_note=soap_note,
                 model_used=asr_model_used,
                 nlu_model_used=nlu_model_used,
+                llm_model_used=llm_model_used,
                 request_id=request_id
             )
             
@@ -667,12 +807,11 @@ async def process_audio(request: ProcessAudioRequest):
             request_id=request_id
         )
 
+# Other endpoints remain unchanged
 @app.post("/embed", response_model=EmbedResponse)
 async def embed_text(request: EmbedRequest):
-    """Generate text embeddings"""
     try:
         if SENTENCE_MODEL is not None:
-            # Use sentence transformer pool for embedding
             vector = await asyncio.get_event_loop().run_in_executor(
                 SENTENCE_POOL, 
                 SENTENCE_MODEL.encode, request.text
@@ -680,7 +819,6 @@ async def embed_text(request: EmbedRequest):
             vector = vector.tolist() if hasattr(vector, 'tolist') else list(vector)
             model_name = "all-MiniLM-L6-v2"
         else:
-            # Fallback to universal embedding in general pool
             vector = await asyncio.get_event_loop().run_in_executor(
                 GENERAL_POOL, 
                 universal_embedding, request.text
@@ -694,7 +832,6 @@ async def embed_text(request: EmbedRequest):
         )
     except Exception as e:
         logger.error(f"Embedding failed: {e}")
-        # Error fallback in general pool
         vector = await asyncio.get_event_loop().run_in_executor(
             GENERAL_POOL, 
             universal_embedding, request.text
@@ -707,28 +844,28 @@ async def embed_text(request: EmbedRequest):
 
 @app.get("/health")
 async def health():
-    """Health check endpoint"""
     return {
         "status": "healthy",
         "models_loaded": {
             "sentence_transformer": SENTENCE_MODEL is not None,
             "whisper": WHISPER_MODEL is not None,
             "biobert": BIOBERT_MODEL is not None,
-            "spacy": SPACY_MODEL is not None
+            "spacy": SPACY_MODEL is not None,
+            "medical_llm": MEDICAL_LLM is not None
         },
         "thread_pools": {
             "sentence_pool": SENTENCE_POOL._max_workers,
             "whisper_pool": WHISPER_POOL._max_workers,
             "biobert_pool": BIOBERT_POOL._max_workers,
             "spacy_pool": SPACY_POOL._max_workers,
-            "general_pool": GENERAL_POOL._max_workers
+            "general_pool": GENERAL_POOL._max_workers,
+            "llm_pool": LLM_POOL._max_workers
         },
         "timestamp": time.time()
     }
 
 @app.get("/model-info")
 async def model_info():
-    """Get model information"""
     if SENTENCE_MODEL is not None:
         return {
             "model_name": "all-MiniLM-L6-v2",
@@ -743,12 +880,11 @@ async def model_info():
 
 @app.get("/")
 async def root():
-    """Root endpoint with service information"""
     return {
-        "service": "Medical Embedding Service",
-        "version": "1.0.0",
+        "service": "Medical NLP Service with LLM SOAP Generation",
+        "version": "2.0.0",
         "endpoints": {
-            "/process-audio": "Process audio for medical transcription",
+            "/process-audio": "Process audio for medical transcription and SOAP generation",
             "/embed": "Generate text embeddings",
             "/health": "Service health check",
             "/model-info": "Model information"
