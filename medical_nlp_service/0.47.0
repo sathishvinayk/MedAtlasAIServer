@@ -1,0 +1,7 @@
+Collecting bitsandbytes
+  Using cached bitsandbytes-0.42.0-py3-none-any.whl.metadata (9.9 kB)
+Requirement already satisfied: scipy in /opt/homebrew/lib/python3.13/site-packages (from bitsandbytes) (1.16.1)
+Requirement already satisfied: numpy<2.6,>=1.25.2 in /opt/homebrew/lib/python3.13/site-packages (from scipy->bitsandbytes) (2.2.6)
+Using cached bitsandbytes-0.42.0-py3-none-any.whl (105.0 MB)
+Installing collected packages: bitsandbytes
+Successfully installed bitsandbytes-0.42.0

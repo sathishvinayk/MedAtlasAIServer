@@ -63,6 +63,7 @@ from transformers import (
     GenerationConfig,
     BitsAndBytesConfig
 )
+from utils import normalize_medication_name, truncate_text
 
 # Lifespan management
 @asynccontextmanager
@@ -202,37 +203,68 @@ class ProcessAudioResponse(BaseModel):
     llm_model_used: str = Field("", description="LLM model used for SOAP generation")
     request_id: str = Field(..., description="Unique request identifier")
 
-# Utility functions (unchanged except for SOAP generation)
-def normalize_medication_name(text: str) -> str:
-    lower_text = text.lower()
-    for synonym, standard in MEDICATION_SYNONYMS.items():
-        if synonym in lower_text:
-            return standard
-    return text
+def filter_negated_entities(transcript: str, entities: List[MedicalEntity]) -> List[MedicalEntity]:
+    """Filter out entities that are mentioned in negative context"""
+    filtered_entities = []
+    transcript_lower = transcript.lower()
+    
+    negation_phrases = [
+        "no ", "not ", "denies ", "denied ", "without ", "negative for ",
+        "never ", "none ", "doesn't have ", "haven't had "
+    ]
+    
+    for entity in entities:
+        entity_text = entity.text.lower()
+        start, end = entity.start, entity.end
+        
+        # Check if the entity appears in a negative context
+        context_start = max(0, start - 50)
+        context_end = min(len(transcript), end + 20)
+        context = transcript_lower[context_start:context_end]
+        
+        is_negated = any(neg in context for neg in negation_phrases)
+        
+        if not is_negated:
+            filtered_entities.append(entity)
+        else:
+            logger.info(f"Filtered out negated entity: {entity.text}")
+    
+    return filtered_entities
 
-def truncate_text(text: str, max_length: int) -> str:
-    if len(text) <= max_length:
-        return text
-    return text[:max_length] + "..."
 
 def deduplicate_entities(entities: List[MedicalEntity]) -> List[MedicalEntity]:
     if not entities:
         return []
     
+    # Sort by start position and length (longer first)
     entities.sort(key=lambda x: (x.start, -(x.end - x.start)))
     
     unique_entities = []
-    seen_positions = set()
+    seen_texts = set()
     
     for entity in entities:
+        # Normalize text for comparison
+        normalized_text = entity.text.lower().strip()
+        
+        # Check for exact duplicates
+        if normalized_text in seen_texts:
+            continue
+            
+        # Check for overlapping entities (keep the longer one)
         overlapping = False
         for selected in unique_entities:
             if (entity.start < selected.end and entity.end > selected.start):
-                overlapping = True
+                # If current entity is longer, replace the existing one
+                if (entity.end - entity.start) > (selected.end - selected.start):
+                    unique_entities.remove(selected)
+                    seen_texts.discard(selected.text.lower().strip())
+                else:
+                    overlapping = True
                 break
         
         if not overlapping:
             unique_entities.append(entity)
+            seen_texts.add(normalized_text)
     
     return unique_entities
 
@@ -406,6 +438,7 @@ def extract_medical_entities_sync(text: str) -> Tuple[List[MedicalEntity], str]:
             logger.warning(f"spaCy extraction failed: {e}")
     
     entities = extract_entities_keywords(text)
+    entities = filter_negated_entities(text, entities)  # <-- ADD THIS LINE
     return entities, model_used
 
 # NEW: LLM-based SOAP note generation
@@ -496,34 +529,47 @@ def generate_soap_note_llm(transcript: str, entities: List[MedicalEntity]) -> st
 
 # Fallback rule-based SOAP generation
 def generate_soap_note_rule_based(transcript: str, entities: List[MedicalEntity]) -> str:
-    """Rule-based SOAP note generation (fallback)"""
+    """Improved rule-based SOAP note generation"""
     symptoms = sorted(set(e.text for e in entities if e.entity == "SYMPTOM"))
-    medications = sorted(set(
-        normalize_medication_name(e.text) 
-        for e in entities if e.entity == "MEDICATION"
-    ))
+    
+    # Fix: Extract just the medication names, not the tuples
+    medications = []
+    for e in entities:
+        if e.entity == "MEDICATION":
+            med_name, confidence = normalize_medication_name(e.text)
+            medications.append(med_name)
+    
+    medications = sorted(set(medications))
     
     symptom_lower = [s.lower() for s in symptoms]
-    med_lower = [m.lower() for m in medications]
+    med_lower = [m.lower() for m in medications]  # This should work now
+    
+    # Rest of your function remains the same...
+    assessment = "Routine follow-up. Symptoms stable and managed with current treatment plan."
     
     if "dizziness" in symptom_lower and any("lisinopril" in m for m in med_lower):
-        assessment = "Dizziness may be related to antihypertensive medication. Consider monitoring blood pressure and potential dosage adjustment."
+        assessment = "Dizziness may be related to lisinopril (antihypertensive medication). Consider monitoring blood pressure and potential dosage adjustment."
     elif "cough" in symptom_lower and any("lisinopril" in m for m in med_lower):
         assessment = "Dry cough is a known side effect of ACE inhibitors like lisinopril. Consider alternative antihypertensive if cough persists."
-    elif "fatigue" in symptom_lower or "tired" in symptom_lower:
-        assessment = "Fatigue reported; evaluate for underlying causes including medication side effects, anemia, or metabolic issues."
-    else:
-        assessment = "Routine follow-up. Symptoms stable and managed with current treatment plan."
+    elif "tired" in symptom_lower or "fatigue" in symptom_lower:
+        if medications:
+            assessment = f"Fatigue reported; evaluate for potential side effects of {medications[0]} or other underlying causes."
+        else:
+            assessment = "Fatigue reported; evaluate for underlying causes including anemia, metabolic issues, or sleep disorders."
+    
+    meds_text = ', '.join(medications) if medications else 'None reported'
+    if not medications and "medication" in transcript.lower():
+        meds_text = "Patient mentioned medication but none specifically identified"
     
     soap_note = f"""SUBJECTIVE:
-        Patient reports: {truncate_text(transcript, 250)}
+        Patient reports: {truncate_text(transcript, 500)}
 
         Presenting symptoms: {', '.join(symptoms) if symptoms else 'None reported'}
 
         OBJECTIVE:
         Vital signs: Within normal limits
         Physical examination: Unremarkable
-        Current medications: {', '.join(medications) if medications else 'None reported'}
+        Current medications: {meds_text}
 
         ASSESSMENT:
         {assessment}
@@ -532,7 +578,8 @@ def generate_soap_note_rule_based(transcript: str, entities: List[MedicalEntity]
         1. Continue current medication regimen with monitoring
         2. Follow up on: {', '.join(symptoms) if symptoms else 'No specific symptoms to monitor'}
         3. Schedule follow-up appointment in 2-4 weeks
-        4. Patient instructed to report any worsening symptoms promptly"""
+        4. Patient instructed to report any worsening symptoms promptly
+        5. Consider medication review if side effects persist"""
     
     return soap_note.strip()
 
