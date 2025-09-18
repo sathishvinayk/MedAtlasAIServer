@@ -64,6 +64,9 @@ from transformers import (
     BitsAndBytesConfig
 )
 from utils import normalize_medication_name, truncate_text
+# from huggingface_hub import hf_hub_download
+# hf_hub_download(repo_id="emilyalsentzer/Bio_ClinicalBERT", filename="pytorch_model.bin", force_download=True)
+# hf_hub_download(repo_id="microsoft/BioGPT-Large", filename="pytorch_model.bin", force_download=True)
 
 # Lifespan management
 @asynccontextmanager
@@ -131,6 +134,7 @@ _models_loaded = False
 # Configuration
 MAX_AUDIO_BYTES = 10 * 1024 * 1024  # 10MB
 WHISPER_MODEL_SIZE = "base"
+# MEDICAL_LLM_NAME = os.getenv('MEDICAL_LLM_NAME', 'emilyalsentzer/Bio_ClinicalBERT')
 MEDICAL_LLM_NAME = os.getenv('MEDICAL_LLM_NAME', 'microsoft/BioGPT-Large')
 # Alternatives: 'mistralai/Mistral-7B-v0.1', 'microsoft/BioGPT-Large', 'stanford-crfm/BioMedLM'
 
@@ -455,7 +459,7 @@ def generate_soap_note_llm(transcript: str, entities: List[MedicalEntity]) -> st
             # Prepare context from extracted entities
             symptoms = sorted(set(e.text for e in entities if e.entity == "SYMPTOM"))
             medications = sorted(set(
-                normalize_medication_name(e.text) 
+                normalize_medication_name(e.text)[0]
                 for e in entities if e.entity == "MEDICATION"
             ))
             
@@ -536,7 +540,7 @@ def generate_soap_note_rule_based(transcript: str, entities: List[MedicalEntity]
     medications = []
     for e in entities:
         if e.entity == "MEDICATION":
-            med_name, confidence = normalize_medication_name(e.text)
+            med_name = normalize_medication_name(e.text)[0]
             medications.append(med_name)
     
     medications = sorted(set(medications))
@@ -655,34 +659,71 @@ async def load_models_async():
                 return None
         
         async def load_medical_llm():
-            """Load fine-tuned medical LLM for SOAP generation"""
+            """Load medical LLM with Apple Silicon support"""
             try:
                 def _load_llm():
-                    # Configure for efficient inference
-                    quantization_config = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch.float16,
-                        bnb_4bit_quant_type="nf4",
-                        bnb_4bit_use_double_quant=True,
-                    )
-                    
-                    # Load tokenizer and model
+                    # Load tokenizer first
                     tokenizer = AutoTokenizer.from_pretrained(
                         MEDICAL_LLM_NAME,
                         trust_remote_code=True
                     )
                     
-                    model = AutoModelForCausalLM.from_pretrained(
-                        MEDICAL_LLM_NAME,
-                        quantization_config=quantization_config,
-                        device_map="auto",
-                        trust_remote_code=True,
-                        torch_dtype=torch.float16
-                    )
-                    
                     # Set padding token if not present
                     if tokenizer.pad_token is None:
                         tokenizer.pad_token = tokenizer.eos_token
+                    
+                    # Determine the best loading strategy based on hardware
+                    if torch.backends.mps.is_available():
+                        # Apple Silicon - load without bitsandbytes
+                        logger.info("Loading model for Apple Silicon (MPS)")
+                        model = AutoModelForCausalLM.from_pretrained(
+                            MEDICAL_LLM_NAME,
+                            device_map="mps",
+                            trust_remote_code=True,
+                            torch_dtype=torch.float16,  # Use half precision for better performance
+                            low_cpu_mem_usage=True
+                        )
+                        
+                    elif torch.cuda.is_available():
+                        # NVIDIA GPU - use bitsandbytes if available
+                        try:
+                            from transformers import BitsAndBytesConfig
+                            quantization_config = BitsAndBytesConfig(
+                                load_in_4bit=True,
+                                bnb_4bit_compute_dtype=torch.float16,
+                                bnb_4bit_quant_type="nf4",
+                                bnb_4bit_use_double_quant=True,
+                            )
+                            
+                            model = AutoModelForCausalLM.from_pretrained(
+                                MEDICAL_LLM_NAME,
+                                quantization_config=quantization_config,
+                                device_map="auto",
+                                trust_remote_code=True,
+                                torch_dtype=torch.float16
+                            )
+                            logger.info("Loaded with CUDA and 4-bit quantization")
+                            
+                        except ImportError:
+                            # Fallback without bitsandbytes
+                            model = AutoModelForCausalLM.from_pretrained(
+                                MEDICAL_LLM_NAME,
+                                device_map="auto",
+                                trust_remote_code=True,
+                                torch_dtype=torch.float16
+                            )
+                            logger.info("Loaded with CUDA (no quantization)")
+                            
+                    else:
+                        # CPU fallback
+                        logger.info("Loading model for CPU")
+                        model = AutoModelForCausalLM.from_pretrained(
+                            MEDICAL_LLM_NAME,
+                            device_map="cpu",
+                            trust_remote_code=True,
+                            torch_dtype=torch.float32,
+                            low_cpu_mem_usage=True
+                        )
                     
                     return model, tokenizer
                 
@@ -691,9 +732,25 @@ async def load_models_async():
                 )
                 logger.info(f"✓ Medical LLM ({MEDICAL_LLM_NAME}) loaded successfully")
                 return model, tokenizer
+                
             except Exception as e:
-                logger.warning(f"Medical LLM failed: {e}")
-                return None, None
+                logger.error(f"Medical LLM failed: {e}")
+                # Try a simpler loading approach as fallback
+                try:
+                    logger.info("Trying simple loading fallback...")
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        MEDICAL_LLM_NAME,
+                        trust_remote_code=True
+                    )
+                    model = AutoModelForCausalLM.from_pretrained(
+                        MEDICAL_LLM_NAME,
+                        trust_remote_code=True
+                    )
+                    logger.info(f"✓ Fallback loading successful for {MEDICAL_LLM_NAME}")
+                    return model, tokenizer
+                except Exception as fallback_error:
+                    logger.error(f"Fallback loading also failed: {fallback_error}")
+                    return None, None
         
         # Load models concurrently
         results = await asyncio.gather(
