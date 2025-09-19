@@ -30,14 +30,6 @@ Technology: Could be a rules-based templating engine or a specialized LLM (like 
 # a) Use a rule-based system to template it into a note: "Patient complains of [SYMPTOM]."
 # b) Send it to a smaller, self-hosted LLM (like a fine-tuned Mistral 7B) with a prompt: "Convert these medical entities into a clinical assessment paragraph: [ENTITIES]"
 # The final note is presented to the user.
-"""
-curl -X POST http://localhost:8080/process-audio \           
-  -H "Content-Type: application/json" \
-  -d "{
-    \"audio_data\": \"$(base64 -i doctor_patient_conversation.mp3 | tr -d '\n')\",
-    \"file_name\": \"doctor_patient_conversation.mp3\"
-  }"
-"""
 # ASR -> NLU -> SOAP
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -144,7 +136,6 @@ WHISPER_MODEL_SIZE = "base"
 MEDICAL_LLM_NAME = os.getenv('MEDICAL_LLM_NAME', 'microsoft/BioGPT-Large')
 # Alternatives: 'mistralai/Mistral-7B-v0.1', 'microsoft/BioGPT-Large', 'stanford-crfm/BioMedLM'
 PYANNOTE_AUTH_TOKEN = os.getenv('PYANNOTE_AUTH_TOKEN', '') 
-
 # Medical keywords and patterns (unchanged)
 MEDICAL_KEYWORDS = {
     "SYMPTOM": ["headache", "fever", "cough", "pain", "nausea", "dizziness", 

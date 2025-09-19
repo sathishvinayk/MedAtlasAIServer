@@ -8,6 +8,6 @@ echo '"file_name": "doctor_patient_conversation.wav"' >> request.json
 echo '}' >> request.json
 
 # Now send the request from the file
-curl -X POST http://localhost:8000/process-audio \
+curl -X POST http://localhost:8080/process-audio \
   -H "Content-Type: application/json" \
   -d "@request.json"

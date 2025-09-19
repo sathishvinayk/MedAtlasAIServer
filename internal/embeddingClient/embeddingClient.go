@@ -21,6 +21,19 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
+type ProcessAudioResponse struct {
+	Status               string   `json:"status"`
+	Transcript           string   `json:"transcript"`
+	Entities             []string `json:"entities"`
+	SOAPNote             string   `json:"soap_note"`
+	SpeakerSegments      string   `json:"speaker_segments"`
+	ModelUsed            string   `json:"model_used"`
+	NLUModelUsed         string   `json:"nlu_model_used"`
+	LLMModelUsed         string   `json:"llm_model_used"`
+	DiarizationModelUsed string   `json:"diarization_model_used"`
+	Error                string   `json:"error,omitempty"`
+}
+
 func (c *Client) ProcessAudio(audioRequest *models.ProcessAudioRequest) (*models.ProcessAudioResponse, error) {
 	jsonData, err := json.Marshal(audioRequest)
 	if err != nil {
