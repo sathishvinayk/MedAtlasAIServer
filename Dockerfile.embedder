@@ -8,11 +8,11 @@ RUN apt-get update && apt-get install -y \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-COPY ./embedding-service/requirements.txt .
+COPY ./medical_nlp_service/requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY ./embedding-service/ .
+COPY ./medical_nlp_service/ .
 
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser

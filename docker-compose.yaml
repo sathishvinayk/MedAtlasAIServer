@@ -10,7 +10,7 @@ services:
     networks:
       - medical-search-net
 
-  embedding-service:
+  medical_nlp-service:
     build:
       context: .
       dockerfile: Dockerfile.embedder
@@ -34,11 +34,11 @@ services:
     environment:
       - PORT=8080
       - QDRANT_HOST=qdrant:6334        # Use docker service name
-      - EMBEDDING_SERVICE_HOST=http://embedding-service:8000 # Use docker service name
+      - MEDICAL_NLP_SERVICE_HOST=http://medical_nlp-service:8000 # Use docker service name
 
     depends_on:
       - qdrant
-      - embedding-service
+      - medical_nlp-service
     networks:
       - medical-search-net
 
