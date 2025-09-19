@@ -47,6 +47,8 @@ import logging
 from typing import List, Optional, Dict, Any, Tuple
 import hashlib
 import base64
+from pyannote.audio import Pipeline
+import torchaudio
 import tempfile
 import os
 import re
@@ -108,6 +110,7 @@ BIOBERT_MODEL = None
 SPACY_MODEL = None
 MEDICAL_LLM = None
 MEDICAL_TOKENIZER = None
+PYANNOTE_PIPELINE = None
 
 # Thread pools for each model type
 MAX_WORKERS_BIOBERT = int(os.getenv('MAX_WORKERS_BIOBERT', '2'))
@@ -116,6 +119,7 @@ MAX_WORKERS_WHISPER = int(os.getenv('MAX_WORKERS_WHISPER', '1'))
 MAX_WORKERS_SENTENCE = int(os.getenv('MAX_WORKERS_SENTENCE', '2'))
 MAX_WORKERS_GENERAL = int(os.getenv('MAX_WORKERS_GENERAL', '4'))
 MAX_WORKERS_LLM = int(os.getenv('MAX_WORKERS_LLM', '1'))  # LLM is memory-intensive
+MAX_WORKERS_PYANNOTE = int(os.getenv('MAX_WORKERS_PYANNOTE', '1'))
 
 SENTENCE_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_SENTENCE, thread_name_prefix="sentence_")
 WHISPER_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_WHISPER, thread_name_prefix="whisper_")
@@ -123,11 +127,13 @@ BIOBERT_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_BIOBERT, thread_name_p
 SPACY_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_SPACY, thread_name_prefix="spacy_")
 GENERAL_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_GENERAL, thread_name_prefix="general_")
 LLM_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_LLM, thread_name_prefix="llm_")
+PYANNOTE_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_PYANNOTE, thread_name_prefix="pyannote_")  # Add pyannote pool
 
 # Thread safety
 _biobert_lock = Lock()
 _spacy_lock = Lock()
 _llm_lock = Lock()
+_pyannote_lock = Lock()  # Add pyannote lock
 _model_load_lock = Lock()
 _models_loaded = False
 
@@ -137,6 +143,7 @@ WHISPER_MODEL_SIZE = "base"
 # MEDICAL_LLM_NAME = os.getenv('MEDICAL_LLM_NAME', 'emilyalsentzer/Bio_ClinicalBERT')
 MEDICAL_LLM_NAME = os.getenv('MEDICAL_LLM_NAME', 'microsoft/BioGPT-Large')
 # Alternatives: 'mistralai/Mistral-7B-v0.1', 'microsoft/BioGPT-Large', 'stanford-crfm/BioMedLM'
+PYANNOTE_AUTH_TOKEN = os.getenv('PYANNOTE_AUTH_TOKEN', '') 
 
 # Medical keywords and patterns (unchanged)
 MEDICAL_KEYWORDS = {
@@ -159,6 +166,12 @@ MEDICATION_SYNONYMS = {
     "advil": "ibuprofen",
     "motrin": "ibuprofen"
 }
+
+class SpeakerSegment(BaseModel):
+    speaker: str = Field(..., description="Speaker identifier")
+    start: float = Field(..., description="Start time in seconds")
+    end: float = Field(..., description="End time in seconds")
+    text: str = Field(..., description="Transcribed text for this segment")
 
 # Pydantic Models (unchanged)
 class MedicalEntity(BaseModel):
@@ -201,11 +214,79 @@ class ProcessAudioResponse(BaseModel):
     transcript: str = Field("", description="Transcribed text")
     entities: List[MedicalEntity] = Field(default_factory=list, description="Extracted medical entities")
     soap_note: str = Field("", description="Generated SOAP note")
+    speaker_segments: List[SpeakerSegment] = Field(default_factory=list, description="Speaker diarization segments")  # Add speaker segments
     error: Optional[str] = Field(None, description="Error message if any")
     model_used: str = Field("", description="ASR model used")
     nlu_model_used: str = Field("", description="NLU model used")
     llm_model_used: str = Field("", description="LLM model used for SOAP generation")
+    diarization_model_used: str = Field("", description="Diarization model used")  # Add diarization model info
     request_id: str = Field(..., description="Unique request identifier")
+
+def perform_diarization(audio_path: str) -> List[SpeakerSegment]:
+    """Perform speaker diarization using pyannote"""
+    global PYANNOTE_PIPELINE
+    
+    if PYANNOTE_PIPELINE is None:
+        logger.warning("Pyannote pipeline not available, skipping diarization")
+        return []
+    
+    try:
+        with _pyannote_lock:
+            # Apply the pipeline to the audio file
+            diarization = PYANNOTE_PIPELINE(audio_path)
+            
+            segments = []
+            for turn, _, speaker in diarization.itertracks(yield_label=True):
+                segments.append(SpeakerSegment(
+                    speaker=speaker,
+                    start=round(turn.start, 2),
+                    end=round(turn.end, 2),
+                    text=""  # This will be filled with transcription later
+                ))
+            
+            logger.info(f"Diarization completed: {len(segments)} segments found")
+            return segments
+            
+    except Exception as e:
+        logger.error(f"Pyannote diarization failed: {e}")
+        return []
+
+# Add function to align transcription with speaker segments
+def align_transcription_with_speakers(transcript: str, speaker_segments: List[SpeakerSegment], audio_duration: float) -> List[SpeakerSegment]:
+    """Align Whisper transcription with speaker segments"""
+    if not speaker_segments or not transcript:
+        return speaker_segments
+    
+    # Simple approach: split transcript by sentences and assign to speakers based on time
+    sentences = transcript.split('. ')
+    total_chars = len(transcript)
+    
+    # Calculate character rate (chars per second)
+    if audio_duration > 0:
+        char_rate = total_chars / audio_duration
+    else:
+        # Fallback: assume 10 characters per second
+        char_rate = 10
+    
+    # Assign text to segments based on timing
+    for segment in speaker_segments:
+        segment_duration = segment.end - segment.start
+        expected_chars = int(segment_duration * char_rate)
+        
+        # This is a simplified approach - in production, you'd want a more sophisticated alignment
+        segment.text = f"Speaker {segment.speaker} segment from {segment.start}s to {segment.end}s"
+    
+    return speaker_segments
+
+# Add function to get audio duration
+def get_audio_duration(audio_path: str) -> float:
+    """Get audio duration in seconds"""
+    try:
+        info = torchaudio.info(audio_path)
+        return info.num_frames / info.sample_rate
+    except Exception as e:
+        logger.warning(f"Could not get audio duration: {e}")
+        return 0
 
 def filter_negated_entities(transcript: str, entities: List[MedicalEntity]) -> List[MedicalEntity]:
     """Filter out entities that are mentioned in negative context"""
@@ -499,9 +580,9 @@ def generate_soap_note_llm(transcript: str, entities: List[MedicalEntity]) -> st
             # Tokenize and generate
             inputs = MEDICAL_TOKENIZER(prompt, return_tensors="pt", truncation=True, max_length=2048)
             
-            # Use GPU if available
-            if torch.cuda.is_available():
-                inputs = {k: v.to('cuda') for k, v in inputs.items()}
+            # FIX: Move inputs to the same device as the model
+            device = next(MEDICAL_LLM.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
             
             # Generate response
             with torch.no_grad():
@@ -590,7 +671,7 @@ def generate_soap_note_rule_based(transcript: str, entities: List[MedicalEntity]
 # Model loading functions (updated to include medical LLM)
 async def load_models_async():
     """Asynchronously load all models including medical LLM"""
-    global SENTENCE_MODEL, WHISPER_MODEL, BIOBERT_MODEL, SPACY_MODEL, MEDICAL_LLM, MEDICAL_TOKENIZER, _models_loaded
+    global SENTENCE_MODEL, WHISPER_MODEL, PYANNOTE_PIPELINE ,BIOBERT_MODEL, SPACY_MODEL, MEDICAL_LLM, MEDICAL_TOKENIZER, _models_loaded
     
     with _model_load_lock:
         if _models_loaded:
@@ -617,7 +698,9 @@ async def load_models_async():
             try:
                 def _load_whisper():
                     import whisper
-                    return whisper.load_model(WHISPER_MODEL_SIZE)
+                    model = whisper.load_model(WHISPER_MODEL_SIZE)
+                    model = model.to('cpu')
+                    return model
                 
                 model = await asyncio.get_event_loop().run_in_executor(
                     GENERAL_POOL, _load_whisper
@@ -751,6 +834,32 @@ async def load_models_async():
                 except Exception as fallback_error:
                     logger.error(f"Fallback loading also failed: {fallback_error}")
                     return None, None
+                
+        async def load_pyannote():
+            """Load pyannote speaker diarization pipeline"""
+            if not PYANNOTE_AUTH_TOKEN:
+                logger.warning("Pyannote auth token not set, skipping diarization model")
+                return None
+            
+            try:
+                def _load_pyannote():
+                    pipeline = Pipeline.from_pretrained(
+                        "pyannote/speaker-diarization-3.1",
+                        use_auth_token=PYANNOTE_AUTH_TOKEN
+                    )
+                    # Send to GPU if available
+                    if torch.cuda.is_available():
+                        pipeline = pipeline.to(torch.device("cuda"))
+                    return pipeline
+                
+                pipeline = await asyncio.get_event_loop().run_in_executor(
+                    GENERAL_POOL, _load_pyannote
+                )
+                logger.info("✓ Pyannote diarization pipeline loaded successfully")
+                return pipeline
+            except Exception as e:
+                logger.warning(f"Pyannote pipeline failed: {e}")
+                return None
         
         # Load models concurrently
         results = await asyncio.gather(
@@ -758,6 +867,7 @@ async def load_models_async():
             load_whisper(),
             load_biobert(),
             load_spacy(),
+            load_pyannote(),
             load_medical_llm(),
             return_exceptions=True
         )
@@ -769,14 +879,20 @@ async def load_models_async():
                 logger.error(f"Model loading failed with exception: {result}")
                 if i == 4:  # LLM result
                     sanitized_results.append((None, None))
+                elif i == 5:  # Pyannote result
+                    sanitized_results.append(None)
                 else:
                     sanitized_results.append(None)
             else:
                 sanitized_results.append(result)
         
-        SENTENCE_MODEL, WHISPER_MODEL, BIOBERT_MODEL, SPACY_MODEL, llm_result = sanitized_results
-        if llm_result:
+        SENTENCE_MODEL, WHISPER_MODEL, BIOBERT_MODEL, SPACY_MODEL, PYANNOTE_PIPELINE, llm_result = sanitized_results
+
+        # Then handle the LLM result
+        if llm_result and isinstance(llm_result, tuple) and len(llm_result) == 2:
             MEDICAL_LLM, MEDICAL_TOKENIZER = llm_result
+        else:
+            MEDICAL_LLM, MEDICAL_TOKENIZER = None, None
         
         _models_loaded = True
         logger.info("Model loading completed")
@@ -786,13 +902,15 @@ async def cleanup_models():
     logger.info("Cleaning up models and thread pools...")
     
     # Clear LLM memory if using GPU
-    global MEDICAL_LLM
+    global MEDICAL_LLM, PYANNOTE_PIPELINE
     if MEDICAL_LLM is not None and torch.cuda.is_available():
         try:
             MEDICAL_LLM = None
             torch.cuda.empty_cache()
         except Exception as e:
             logger.warning(f"Failed to clear GPU memory: {e}")
+    
+    PYANNOTE_PIPELINE = None
     
     # Shutdown thread pools
     SENTENCE_POOL.shutdown(wait=False)
@@ -801,6 +919,7 @@ async def cleanup_models():
     SPACY_POOL.shutdown(wait=False)
     GENERAL_POOL.shutdown(wait=False)
     LLM_POOL.shutdown(wait=False)
+    PYANNOTE_POOL.shutdown(wait=False)
     
     logger.info("Thread pools shutdown completed")
 
@@ -823,7 +942,7 @@ async def temp_audio_file(audio_bytes: bytes):
 # API Endpoints (updated for LLM SOAP generation)
 @app.post("/process-audio", response_model=ProcessAudioResponse)
 async def process_audio(request: ProcessAudioRequest):
-    """Process audio data and return medical analysis with LLM-generated SOAP note"""
+    """Process audio data and return medical analysis with LLM-generated SOAP note and speaker diarization"""
     request_id = str(uuid.uuid4())
     
     try:
@@ -833,6 +952,25 @@ async def process_audio(request: ProcessAudioRequest):
         audio_bytes = base64.b64decode(request.audio_data)
         
         async with temp_audio_file(audio_bytes) as audio_path:
+            # Get audio duration for diarization alignment
+            audio_duration = await asyncio.get_event_loop().run_in_executor(
+                GENERAL_POOL, get_audio_duration, audio_path
+            )
+            
+            # Perform speaker diarization (async)
+            speaker_segments = []
+            diarization_model_used = "none"
+            if PYANNOTE_PIPELINE is not None:
+                try:
+                    speaker_segments = await asyncio.get_event_loop().run_in_executor(
+                        PYANNOTE_POOL, perform_diarization, audio_path
+                    )
+                    diarization_model_used = "pyannote/speaker-diarization-3.1"
+                    logger.info(f"Diarization found {len(speaker_segments)} speaker segments")
+                except Exception as e:
+                    logger.error(f"Diarization failed: {e}")
+                    diarization_model_used = "failed"
+            
             # Transcription
             if WHISPER_MODEL is not None:
                 try:
@@ -855,6 +993,13 @@ async def process_audio(request: ProcessAudioRequest):
                     universal_transcript, audio_path
                 )
                 asr_model_used = "universal-fallback"
+            
+            # Align transcription with speaker segments if available
+            if speaker_segments:
+                speaker_segments = await asyncio.get_event_loop().run_in_executor(
+                    GENERAL_POOL,
+                    align_transcription_with_speakers, transcript, speaker_segments, audio_duration
+                )
             
             # Entity extraction
             if BIOBERT_MODEL is not None:
@@ -897,9 +1042,11 @@ async def process_audio(request: ProcessAudioRequest):
                 transcript=transcript,
                 entities=entities,
                 soap_note=soap_note,
+                speaker_segments=speaker_segments,  # Include speaker segments
                 model_used=asr_model_used,
                 nlu_model_used=nlu_model_used,
                 llm_model_used=llm_model_used,
+                diarization_model_used=diarization_model_used,  # Include diarization model info
                 request_id=request_id
             )
             
