@@ -31,12 +31,13 @@ Technology: Could be a rules-based templating engine or a specialized LLM (like 
 # b) Send it to a smaller, self-hosted LLM (like a fine-tuned Mistral 7B) with a prompt: "Convert these medical entities into a clinical assessment paragraph: [ENTITIES]"
 # The final note is presented to the user.
 # ASR -> NLU -> SOAP
-from fastapi import FastAPI, HTTPException
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 import numpy as np
 import logging
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, AsyncIterator
 import hashlib
 import base64
 from pyannote.audio import Pipeline
@@ -46,10 +47,13 @@ import os
 import re
 import asyncio
 import time
+import grpc
 from threading import Lock
 from contextlib import asynccontextmanager
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+import audio_processor_pb2
+import audio_processor_pb2_grpc
 import torch
 from transformers import (
     AutoTokenizer, 
@@ -61,6 +65,120 @@ from utils import normalize_medication_name, truncate_text
 # from huggingface_hub import hf_hub_download
 # hf_hub_download(repo_id="emilyalsentzer/Bio_ClinicalBERT", filename="pytorch_model.bin", force_download=True)
 # hf_hub_download(repo_id="microsoft/BioGPT-Large", filename="pytorch_model.bin", force_download=True)
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+    async def send_personal_message(self, message: dict, websocket: WebSocket):
+        await websocket.send_json(message)
+
+manager = ConnectionManager()
+
+class StreamingAudioRequest(BaseModel):
+    session_id: str = Field(..., description="Unique session identifier")
+    audio_chunk: str = Field(..., description="Base64 encoded audio chunk")
+    chunk_index: int = Field(..., description="Chunk sequence number")
+    is_final: bool = Field(False, description="Is this the final chunk")
+
+class StreamingAudioResponse(BaseModel):
+    type: str = Field(..., description="Result type: transcript, speaker, entities, soap_note")
+    data: dict = Field(..., description="The actual data payload")
+    session_id: str = Field(..., description="Session identifier")
+    is_partial: bool = Field(True, description="Is this a partial result")
+
+class AudioProcessorService(audio_processor_pb2_grpc.AudioProcessorService):
+    def __init__(self):
+        self.sessions = {}
+    
+    async def ProcessAudioStream(self, request_iterator: AsyncIterator, context):
+        session_id = None
+        audio_buffer = []
+
+        try:
+            async for chunk in request_iterator:
+                if not session_id:
+                    session_id = chunk.session_id
+                    self.sessions[session_id] = {
+                        'audio_buffer': [],
+                        'transcript_parts': [],
+                        'start_time': asyncio.get_event_loop().time()
+                    }
+                    logger.info(f"Started gRPC streaming session: {session_id}")
+
+                audio_buffer.append(chunk.audio_data)
+                if len(audio_buffer) >= 20 or chunk.is_final:
+                    combined_audio = b''.join(audio_buffer)
+                    results = await self._process_streaming_chunk(
+                        session_id, combined_audio, chunk.is_final
+                    )
+                    audio_buffer = []
+                    for result in results:
+                        yield result
+                
+                if chunk.is_final:
+                    break
+        except Exception as e:
+            logger.error(f"gRPC stream processing error: {e}")
+        finally:
+            if session_id in self.sessions:
+                del self.sessions[session_id]
+    
+    async def _process_streaming_chunk(self, session_id: str, audio_data: bytes, is_final: bool = False):
+        results = []
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
+                tmp_file.write(audio_data)
+                audio_path = tmp_file.name
+            
+            # Transcription
+            if WHISPER_MODEL:
+                transcript = await asyncio.get_event_loop().run_in_executor(
+                    WHISPER_POOL,
+                    lambda: WHISPER_MODEL.transcribe(audio_path)
+                )
+                transcript_text = transcript.get("text", "").strip()
+
+                if transcript_text:
+                    if 'transcript_parts' not in self.sessions[session_id]:
+                        self.sessions[session_id]['transcript_parts'] = []
+                    self.sessions[session_id]['transcript_parts'].append(transcript_text)
+
+                    results.append(audio_processor_pb2.ProcessingResult(
+                        session_id=session_id
+                        transcript=audio_processor_pb2.TranscriptChunk(
+                            text=transcript_text,
+                            is_partial=not is_final,
+                            start_time_ms=0,
+                            end_time_ms=2000,
+                        )
+                    ))
+        # Diarizations
+        current_transcript = ' '.join(self.sessions[session_id].get['transcript_parts', []])
+        if is_final and PYANNOTE_PIPELINE and len(audio_data) > 10000:
+            speaker_segments = await asyncio.get_event_loop().run_in_executor(
+                PYANNOTE_POOL, perform_diarization, audio_data
+            )
+            if speaker_segments:
+                speaker_update = audio_processor_pb2.SpeakerUpdate()
+                for segment in speaker_segments:
+                    speaker_update.segments.append(
+                        audio_processor_pb2.SpeakerSegment(
+                            speaker_id=segment.speaker,
+                            start_time=segment.start,
+                            end_time=segment.end,
+                            confidence=0.9s
+                        )
+                    )
+                
+                results.append(audio_processor_pb2.ProcessingResult(
+                    session_id=session_id,
+                    speaker=speaker_update
+                ))
 
 # Lifespan management
 @asynccontextmanager
