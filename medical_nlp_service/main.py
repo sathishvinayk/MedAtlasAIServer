@@ -91,7 +91,7 @@ class StreamingAudioResponse(BaseModel):
     session_id: str = Field(..., description="Session identifier")
     is_partial: bool = Field(True, description="Is this a partial result")
 
-class AudioProcessorService(audio_processor_pb2_grpc.AudioProcessorService):
+class AudioProcessorService(audio_processor_pb2_grpc.AudioProcessorServicer):
     def __init__(self):
         self.sessions = {}
     
@@ -149,7 +149,7 @@ class AudioProcessorService(audio_processor_pb2_grpc.AudioProcessorService):
                     self.sessions[session_id]['transcript_parts'].append(transcript_text)
 
                     results.append(audio_processor_pb2.ProcessingResult(
-                        session_id=session_id
+                        session_id=session_id,
                         transcript=audio_processor_pb2.TranscriptChunk(
                             text=transcript_text,
                             is_partial=not is_final,
@@ -157,34 +157,102 @@ class AudioProcessorService(audio_processor_pb2_grpc.AudioProcessorService):
                             end_time_ms=2000,
                         )
                     ))
-        # Diarizations
-        current_transcript = ' '.join(self.sessions[session_id].get['transcript_parts', []])
-        if is_final and PYANNOTE_PIPELINE and len(audio_data) > 10000:
-            speaker_segments = await asyncio.get_event_loop().run_in_executor(
-                PYANNOTE_POOL, perform_diarization, audio_data
-            )
-            if speaker_segments:
-                speaker_update = audio_processor_pb2.SpeakerUpdate()
-                for segment in speaker_segments:
-                    speaker_update.segments.append(
-                        audio_processor_pb2.SpeakerSegment(
-                            speaker_id=segment.speaker,
-                            start_time=segment.start,
-                            end_time=segment.end,
-                            confidence=0.9s
+            # Diarizations
+            current_transcript = ' '.join(self.sessions[session_id].get['transcript_parts', []])
+            if is_final and PYANNOTE_PIPELINE and len(audio_data) > 10000:
+                speaker_segments = await asyncio.get_event_loop().run_in_executor(
+                    PYANNOTE_POOL, perform_diarization, audio_data
+                )
+                if speaker_segments:
+                    speaker_update = audio_processor_pb2.SpeakerUpdate()
+                    for segment in speaker_segments:
+                        speaker_update.segments.append(
+                            audio_processor_pb2.SpeakerSegment(
+                                speaker_id=segment.speaker,
+                                start_time=segment.start,
+                                end_time=segment.end,
+                                confidence=0.9
+                            )
                         )
+                    
+                    results.append(audio_processor_pb2.ProcessingResult(
+                        session_id=session_id,
+                        speaker=speaker_update
+                    ))
+            # 3. Entity extraction on meaningful content
+            if current_transcript and ('.' in current_transcript or is_final):
+                entities, _ = await asyncio.get_event_loop().run_in_executor(
+                    GENERAL_POOL, extract_medical_entities_sync, current_transcript
+                )
+
+                if entities:
+                    entity_update = audio_processor_pb2.EntityUpdate()
+                    for entity in entities:
+                        entity_update.entities.append(
+                            audio_processor_pb2.MedicalEntity(
+                                entity_type=entity.entity,
+                                text=entity.text,
+                                start=entity.start,
+                                end=entity.end,
+                                confidence=entity.confidence
+                            )
+                        )
+                    results.append(audio_processor_pb2.ProcessingResult(
+                        session_id=session_id,
+                        entities=entity_update
+                    ))
+            # 4. SOAP note generation only on final chunk
+            if is_final and current_transcript.strip():
+                entities, _ = await asyncio.get_event_loop().run_in_executor(
+                    GENERAL_POOL, extract_medical_entities_sync, current_transcript
+                )
+                if MEDICAL_LLM:
+                    soap_note = await asyncio.get_event_loop().run_in_executor(
+                        LLM_POOL, generate_soap_note_llm, current_transcript, entities
                     )
+                else:
+                    soap_note = generate_soap_note_rule_based(current_transcript)
                 
                 results.append(audio_processor_pb2.ProcessingResult(
                     session_id=session_id,
-                    speaker=speaker_update
+                    soap_note=audio_processor_pb2.SoapNoteUpdate(
+                        content=soap_note,
+                        is_complete=True
+                    )
                 ))
+        
+            os.unlink(audio_path)
+        
+        except Exception as e:
+            logger.error(f"Streaming chunk processing error: {e}")
+        
+        return results
+
+async def start_grpc_server():
+    """gRPC server for streaming processing"""
+    try:
+        server = grpc.aio.server(ThreadPoolExecutor(max_workers=5))
+        audio_processor_pb2_grpc.add_AudioProcessorServicer_to_server(
+            AudioProcessorService(), server
+        )
+        grpc_port = 50051
+        server.add_insecure_port(f'[::]:{grpc_port}')
+        await server.start()
+        logger.info(f"gRPC streaming server started on port {grpc_port}")
+
+        await server.wait_for_termination()
+    except Exception as e:
+        logger.error(f"gRPC server failed to start: {e}")
+
 
 # Lifespan management
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: load models
     await load_models_async()
+
+    asyncio.create_task(start_grpc_server())
+
     yield
     # Shutdown: cleanup
     await cleanup_models()
@@ -1165,6 +1233,185 @@ async def process_audio(request: ProcessAudioRequest):
             status="error",
             error=f"Processing failed: {str(e)}",
             request_id=request_id
+        )
+    
+@app.websocket("/ws/process-audio")
+async def websocket_process_audio(websocket: WebSocket):
+    session_id = str(uuid.uuid4())
+    await manager.connect(websocket)
+
+    try:
+        audio_chunks = []
+        transcript_buffer = []
+
+        while True:
+            data = await websocket.receive_json()
+
+            if data.get("type") == "audio_chunk":
+                audio_data = base64.b64decode(data["chunk"])
+                audio_chunks.append(audio_data)
+                chunk_index = data.get("chunk_index", 0)
+                is_final = data.get("is_final", False)
+
+                if len(audio_data) >= 20 or is_final:
+                    combined_audio = b''.join(audio_chunks)
+
+                    if WHISPER_MODEL:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
+                            tmp_file.write(combined_audio)
+                            audio_path = tmp_file.name
+                        
+                        try:
+                            transcript = await asyncio.get_event_loop().run_in_executor(
+                                WHISPER_POOL, 
+                                lambda: WHISPER_MODEL.transcribe(audio_path)
+                            )
+                            transcript_text = transcript.get("text", "").strip()
+                            if transcript_text:
+                                transcript_buffer.append(transcript_text)
+                                full_transcript = " ".join(transcript_buffer)
+                                
+                                # Send transcript update
+                                await manager.send_personal_message({
+                                    "type": "transcript",
+                                    "data": {
+                                        "text": transcript_text,
+                                        "full_transcript": full_transcript,
+                                        "is_partial": not is_final
+                                    },
+                                    "session_id": session_id
+                                }, websocket)
+                                if '.' in transcript_text or is_final:
+                                    entities, _ = await asyncio.get_event_loop().run_in_executor(
+                                        GENERAL_POOL, extract_medical_entities_sync, full_transcript
+                                    )
+                                    
+                                    if entities:
+                                        await manager.send_personal_message({
+                                            "type": "entities",
+                                            "data": {
+                                                "entities": [entity.dict() for entity in entities]
+                                            },
+                                            "session_id": session_id
+                                        }, websocket)
+                        finally:
+                            os.unlink(audio_path)
+
+                    audio_chunks = [] 
+
+                    if is_final and transcript_buffer:
+                        full_transcript = " ".join(transcript_buffer)
+
+                        # Diarization
+                        if PYANNOTE_PIPELINE and len(combined_audio) > 10000:
+                            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
+                                tmp_file.write(combined_audio)
+                                audio_path = tmp_file.name
+                            
+                            try:
+                                speaker_segments = await asyncio.get_event_loop().run_in_executor(
+                                    PYANNOTE_POOL, perform_diarization, audio_path
+                                )
+                                if speaker_segments:
+                                    await manager.send_personal_message({
+                                        "type": "speaker_segments",
+                                        "data": {
+                                            "segments": [segment.dict() for segment in speaker_segments]
+                                        },
+                                        "session_id": session_id
+                                    }, websocket)
+                            finally:
+                                os.unlink(audio_path)
+                        
+                        # SOAP note generation
+                        entities, _ = await asyncio.get_event_loop().run_in_executor(
+                            GENERAL_POOL, extract_medical_entities_sync, full_transcript
+                        )
+                        if MEDICAL_LLM:
+                            soap_note = await asyncio.get_event_loop().run_in_executor(
+                                LLM_POOL, generate_soap_note_llm, full_transcript, entities
+                            )
+                        else:
+                            soap_note = generate_soap_note_rule_based(full_transcript, entities)
+                        
+                        await manager.send_personal_message({
+                            "type": "soap_note",
+                            "data": {
+                                "content": soap_note,
+                                "is_complete": True
+                            },
+                            "session_id": session_id
+                        }, websocket)
+                        
+                        # Send completion signal
+                        await manager.send_personal_message({
+                            "type": "complete",
+                            "data": {"status": "processing_finished"},
+                            "session_id": session_id
+                        }, websocket)
+                
+                elif data.get("type") == "ping":
+                    # Keep connection alive
+                    await manager.send_personal_message({
+                        "type": "pong",
+                        "data": {"timestamp": time.time()},
+                        "session_id": session_id
+                    }, websocket)
+
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected for session {session_id}")
+    except Exception as e:
+        logger.error(f"WebSocket processing error: {e}")
+        await manager.send_personal_message({
+            "type": "error",
+            "data": {"message": str(e)},
+            "session_id": session_id
+        }, websocket)
+    finally:
+        manager.disconnect(websocket)
+
+@app.post("/stream/process-audio", response_model=StreamingAudioResponse)
+async def stream_process_audio(request: StreamingAudioRequest):
+    """HTTP endpoint for streaming audio processing"""
+    try:
+        audio_data = base64.b64decode(request.audio_chunk)
+        session_id = request.session_id
+
+        if WHISPER_MODEL:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
+                tmp_file.write(audio_data)
+                audio_path = tmp_file.name
+            
+            try:
+                transcript = await asyncio.get_event_loop().run_in_executor(
+                    WHISPER_POOL, 
+                    lambda: WHISPER_MODEL.transcribe(audio_path)
+                )
+                transcript_text = transcript.get("text", "").strip()
+                
+                return StreamingAudioResponse(
+                    type="transcript",
+                    data={"text": transcript_text, "chunk_index": request.chunk_index},
+                    session_id=session_id,
+                    is_partial=not request.is_final
+                )
+            finally:
+                os.unlink(audio_path)
+        
+        return StreamingAudioResponse(
+            type="error",
+            data={"message": "Whisper model not available"},
+            session_id=session_id,
+            is_partial=True
+        )
+        
+    except Exception as e:
+        logger.error(f"Stream processing error: {e}")
+        return StreamingAudioResponse(
+            type="error",
+            data={"message": str(e)},
+            session_id=request.session_id,
+            is_partial=True
         )
 
 # Other endpoints remain unchanged
