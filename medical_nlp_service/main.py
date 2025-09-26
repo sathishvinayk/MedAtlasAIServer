@@ -96,8 +96,9 @@ class AudioProcessorService(audio_processor_pb2_grpc.AudioProcessorServicer):
         self.sessions = {}
     
     async def ProcessAudioStream(self, request_iterator: AsyncIterator, context):
+        logger.info(f"gRPC stream connection established, waiting for chunks...")
         session_id = None
-        audio_buffer = []
+        audio_buffer = []  # Keep the buffer for better processing
 
         try:
             async for chunk in request_iterator:
@@ -109,21 +110,32 @@ class AudioProcessorService(audio_processor_pb2_grpc.AudioProcessorServicer):
                         'start_time': asyncio.get_event_loop().time()
                     }
                     logger.info(f"Started gRPC streaming session: {session_id}")
-
+                
                 audio_buffer.append(chunk.audio_data)
-                if len(audio_buffer) >= 20 or chunk.is_final:
+
+                if len(audio_buffer) >= 5 or chunk.is_final: 
                     combined_audio = b''.join(audio_buffer)
+                
                     results = await self._process_streaming_chunk(
                         session_id, combined_audio, chunk.is_final
                     )
+
                     audio_buffer = []
                     for result in results:
                         yield result
-                
+
                 if chunk.is_final:
+                    logger.info(f"Final chunk received for session {session_id}")
                     break
         except Exception as e:
             logger.error(f"gRPC stream processing error: {e}")
+            yield audio_processor_pb2.ProcessingResult(
+                session_id=session_id or "unknown",
+                status=audio_processor_pb2.StatusUpdate(
+                    stage="error",
+                    progress=0.0
+                )
+            )
         finally:
             if session_id in self.sessions:
                 del self.sessions[session_id]
@@ -158,7 +170,7 @@ class AudioProcessorService(audio_processor_pb2_grpc.AudioProcessorServicer):
                         )
                     ))
             # Diarizations
-            current_transcript = ' '.join(self.sessions[session_id].get['transcript_parts', []])
+            current_transcript = ' '.join(self.sessions[session_id].get('transcript_parts', []))
             if is_final and PYANNOTE_PIPELINE and len(audio_data) > 10000:
                 speaker_segments = await asyncio.get_event_loop().run_in_executor(
                     PYANNOTE_POOL, perform_diarization, audio_data
@@ -1115,125 +1127,6 @@ async def temp_audio_file(audio_bytes: bytes):
                 os.unlink(temp_path)
             except Exception as e:
                 logger.warning(f"Failed to delete temp file {temp_path}: {e}")
-
-# API Endpoints (updated for LLM SOAP generation)
-@app.post("/process-audio", response_model=ProcessAudioResponse)
-async def process_audio(request: ProcessAudioRequest):
-    """Process audio data and return medical analysis with LLM-generated SOAP note and speaker diarization"""
-    request_id = str(uuid.uuid4())
-    
-    try:
-        logger.info(f"Processing audio request {request_id}")
-        
-        # Decode and validate audio
-        audio_bytes = base64.b64decode(request.audio_data)
-        
-        async with temp_audio_file(audio_bytes) as audio_path:
-            # Get audio duration for diarization alignment
-            audio_duration = await asyncio.get_event_loop().run_in_executor(
-                GENERAL_POOL, get_audio_duration, audio_path
-            )
-            
-            # Perform speaker diarization (async)
-            speaker_segments = []
-            diarization_model_used = "none"
-            if PYANNOTE_PIPELINE is not None:
-                try:
-                    speaker_segments = await asyncio.get_event_loop().run_in_executor(
-                        PYANNOTE_POOL, perform_diarization, audio_path
-                    )
-                    diarization_model_used = "pyannote/speaker-diarization-3.1"
-                    logger.info(f"Diarization found {len(speaker_segments)} speaker segments")
-                except Exception as e:
-                    logger.error(f"Diarization failed: {e}")
-                    diarization_model_used = "failed"
-            
-            # Transcription
-            if WHISPER_MODEL is not None:
-                try:
-                    result = await asyncio.get_event_loop().run_in_executor(
-                        WHISPER_POOL, 
-                        lambda: WHISPER_MODEL.transcribe(audio_path)
-                    )
-                    transcript = result.get("text", "")
-                    asr_model_used = f"whisper-{WHISPER_MODEL_SIZE}"
-                except Exception as e:
-                    logger.warning(f"Whisper transcription failed: {e}")
-                    transcript = await asyncio.get_event_loop().run_in_executor(
-                        GENERAL_POOL, 
-                        universal_transcript, audio_path
-                    )
-                    asr_model_used = "universal-fallback"
-            else:
-                transcript = await asyncio.get_event_loop().run_in_executor(
-                    GENERAL_POOL, 
-                    universal_transcript, audio_path
-                )
-                asr_model_used = "universal-fallback"
-            
-            # Align transcription with speaker segments if available
-            if speaker_segments:
-                speaker_segments = await asyncio.get_event_loop().run_in_executor(
-                    GENERAL_POOL,
-                    align_transcription_with_speakers, transcript, speaker_segments, audio_duration
-                )
-            
-            # Entity extraction
-            if BIOBERT_MODEL is not None:
-                entities, nlu_model_used = await asyncio.get_event_loop().run_in_executor(
-                    BIOBERT_POOL, 
-                    extract_medical_entities_sync, transcript
-                )
-            elif SPACY_MODEL is not None:
-                entities, nlu_model_used = await asyncio.get_event_loop().run_in_executor(
-                    SPACY_POOL, 
-                    extract_medical_entities_sync, transcript
-                )
-            else:
-                entities, nlu_model_used = await asyncio.get_event_loop().run_in_executor(
-                    GENERAL_POOL, 
-                    extract_medical_entities_sync, transcript
-                )
-            
-            # SOAP note generation with LLM
-            llm_model_used = "none"
-            if MEDICAL_LLM is not None:
-                try:
-                    soap_note = await asyncio.get_event_loop().run_in_executor(
-                        LLM_POOL, 
-                        generate_soap_note_llm, transcript, entities
-                    )
-                    llm_model_used = MEDICAL_LLM_NAME
-                except Exception as e:
-                    logger.error(f"LLM SOAP generation failed: {e}")
-                    soap_note = generate_soap_note_rule_based(transcript, entities)
-                    llm_model_used = "rule-based-fallback"
-            else:
-                soap_note = generate_soap_note_rule_based(transcript, entities)
-                llm_model_used = "rule-based"
-            
-            logger.info(f"Request {request_id} completed successfully")
-            
-            return ProcessAudioResponse(
-                status="success",
-                transcript=transcript,
-                entities=entities,
-                soap_note=soap_note,
-                speaker_segments=speaker_segments,  # Include speaker segments
-                model_used=asr_model_used,
-                nlu_model_used=nlu_model_used,
-                llm_model_used=llm_model_used,
-                diarization_model_used=diarization_model_used,  # Include diarization model info
-                request_id=request_id
-            )
-            
-    except Exception as e:
-        logger.error(f"Request {request_id} failed: {e}", exc_info=True)
-        return ProcessAudioResponse(
-            status="error",
-            error=f"Processing failed: {str(e)}",
-            request_id=request_id
-        )
     
 @app.websocket("/ws/process-audio")
 async def websocket_process_audio(websocket: WebSocket):
@@ -1414,6 +1307,125 @@ async def stream_process_audio(request: StreamingAudioRequest):
             is_partial=True
         )
 
+# API Endpoints (updated for LLM SOAP generation)
+@app.post("/process-audio", response_model=ProcessAudioResponse)
+async def process_audio(request: ProcessAudioRequest):
+    """Process audio data and return medical analysis with LLM-generated SOAP note and speaker diarization"""
+    request_id = str(uuid.uuid4())
+    
+    try:
+        logger.info(f"Processing audio request {request_id}")
+        
+        # Decode and validate audio
+        audio_bytes = base64.b64decode(request.audio_data)
+        
+        async with temp_audio_file(audio_bytes) as audio_path:
+            # Get audio duration for diarization alignment
+            audio_duration = await asyncio.get_event_loop().run_in_executor(
+                GENERAL_POOL, get_audio_duration, audio_path
+            )
+            
+            # Perform speaker diarization (async)
+            speaker_segments = []
+            diarization_model_used = "none"
+            if PYANNOTE_PIPELINE is not None:
+                try:
+                    speaker_segments = await asyncio.get_event_loop().run_in_executor(
+                        PYANNOTE_POOL, perform_diarization, audio_path
+                    )
+                    diarization_model_used = "pyannote/speaker-diarization-3.1"
+                    logger.info(f"Diarization found {len(speaker_segments)} speaker segments")
+                except Exception as e:
+                    logger.error(f"Diarization failed: {e}")
+                    diarization_model_used = "failed"
+            
+            # Transcription
+            if WHISPER_MODEL is not None:
+                try:
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        WHISPER_POOL, 
+                        lambda: WHISPER_MODEL.transcribe(audio_path)
+                    )
+                    transcript = result.get("text", "")
+                    asr_model_used = f"whisper-{WHISPER_MODEL_SIZE}"
+                except Exception as e:
+                    logger.warning(f"Whisper transcription failed: {e}")
+                    transcript = await asyncio.get_event_loop().run_in_executor(
+                        GENERAL_POOL, 
+                        universal_transcript, audio_path
+                    )
+                    asr_model_used = "universal-fallback"
+            else:
+                transcript = await asyncio.get_event_loop().run_in_executor(
+                    GENERAL_POOL, 
+                    universal_transcript, audio_path
+                )
+                asr_model_used = "universal-fallback"
+            
+            # Align transcription with speaker segments if available
+            if speaker_segments:
+                speaker_segments = await asyncio.get_event_loop().run_in_executor(
+                    GENERAL_POOL,
+                    align_transcription_with_speakers, transcript, speaker_segments, audio_duration
+                )
+            
+            # Entity extraction
+            if BIOBERT_MODEL is not None:
+                entities, nlu_model_used = await asyncio.get_event_loop().run_in_executor(
+                    BIOBERT_POOL, 
+                    extract_medical_entities_sync, transcript
+                )
+            elif SPACY_MODEL is not None:
+                entities, nlu_model_used = await asyncio.get_event_loop().run_in_executor(
+                    SPACY_POOL, 
+                    extract_medical_entities_sync, transcript
+                )
+            else:
+                entities, nlu_model_used = await asyncio.get_event_loop().run_in_executor(
+                    GENERAL_POOL, 
+                    extract_medical_entities_sync, transcript
+                )
+            
+            # SOAP note generation with LLM
+            llm_model_used = "none"
+            if MEDICAL_LLM is not None:
+                try:
+                    soap_note = await asyncio.get_event_loop().run_in_executor(
+                        LLM_POOL, 
+                        generate_soap_note_llm, transcript, entities
+                    )
+                    llm_model_used = MEDICAL_LLM_NAME
+                except Exception as e:
+                    logger.error(f"LLM SOAP generation failed: {e}")
+                    soap_note = generate_soap_note_rule_based(transcript, entities)
+                    llm_model_used = "rule-based-fallback"
+            else:
+                soap_note = generate_soap_note_rule_based(transcript, entities)
+                llm_model_used = "rule-based"
+            
+            logger.info(f"Request {request_id} completed successfully")
+            
+            return ProcessAudioResponse(
+                status="success",
+                transcript=transcript,
+                entities=entities,
+                soap_note=soap_note,
+                speaker_segments=speaker_segments,  # Include speaker segments
+                model_used=asr_model_used,
+                nlu_model_used=nlu_model_used,
+                llm_model_used=llm_model_used,
+                diarization_model_used=diarization_model_used,  # Include diarization model info
+                request_id=request_id
+            )
+            
+    except Exception as e:
+        logger.error(f"Request {request_id} failed: {e}", exc_info=True)
+        return ProcessAudioResponse(
+            status="error",
+            error=f"Processing failed: {str(e)}",
+            request_id=request_id
+        )
+    
 # Other endpoints remain unchanged
 @app.post("/embed", response_model=EmbedResponse)
 async def embed_text(request: EmbedRequest):

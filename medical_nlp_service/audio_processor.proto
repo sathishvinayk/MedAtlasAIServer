@@ -18,12 +18,15 @@ message AudioChunk {
 message ProcessingResult {
   oneof result {
     TranscriptChunk transcript = 1;
-    EntityUpdate entities = 2;
-    SpeakerSegment speaker = 3;
-    StatusUpdate status = 4;
-    SoapNoteUpdate soap_note = 5;
+    SpeakerUpdate speaker = 2;
+    EntityUpdate entities = 3;
+    SoapNoteUpdate soap_note = 4;
   }
   string session_id = 6;
+}
+
+message SpeakerUpdate {
+    repeated SpeakerSegment segments = 1;
 }
 
 message TranscriptChunk {

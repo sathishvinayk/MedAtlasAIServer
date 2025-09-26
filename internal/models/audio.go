@@ -1,5 +1,29 @@
 package models
 
+type StreamingAudioRequest struct {
+	SessionID  string `json:"session_id"`
+	AudioChunk string `json:"audio_chunk"`
+	ChunkIndex int    `json:"chunk_index"`
+	IsFinal    bool   `json:"is_final"`
+}
+
+type StreamingResult struct {
+	Type      string                 `json:"type"`
+	Data      map[string]interface{} `json:"data"`
+	SessionID string                 `json:"session_id"`
+	IsPartial bool                   `json:"is_partial"`
+}
+
+type StreamingSession struct {
+	SessionID         string `json:"session_id"`
+	Status            string `json:"status"`
+	AudioChunks       [][]byte
+	CurrentTranscript string
+	SpeakerSegments   []SpeakerSegment
+	Entities          []MedicalEntity
+	CreatedAt         int64
+}
+
 type ProcessAudioRequest struct {
 	AudioData []byte `json:"audio_data"`
 	FileName  string `json:"file_name"`

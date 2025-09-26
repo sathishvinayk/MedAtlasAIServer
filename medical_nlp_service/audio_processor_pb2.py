@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x15\x61udio_processor.proto\x12\x0f\x61udio_processor\"p\n\nAudioChunk\x12\x12\n\naudio_data\x18\x01 \x01(\x0c\x12\x12\n\nsession_id\x18\x02 \x01(\t\x12\x13\n\x0bsample_rate\x18\x03 \x01(\x05\x12\x13\n\x0b\x63hunk_index\x18\x04 \x01(\x05\x12\x10\n\x08is_final\x18\x05 \x01(\x08\"\xb6\x02\n\x10ProcessingResult\x12\x36\n\ntranscript\x18\x01 \x01(\x0b\x32 .audio_processor.TranscriptChunkH\x00\x12\x31\n\x08\x65ntities\x18\x02 \x01(\x0b\x32\x1d.audio_processor.EntityUpdateH\x00\x12\x32\n\x07speaker\x18\x03 \x01(\x0b\x32\x1f.audio_processor.SpeakerSegmentH\x00\x12/\n\x06status\x18\x04 \x01(\x0b\x32\x1d.audio_processor.StatusUpdateH\x00\x12\x34\n\tsoap_note\x18\x05 \x01(\x0b\x32\x1f.audio_processor.SoapNoteUpdateH\x00\x12\x12\n\nsession_id\x18\x06 \x01(\tB\x08\n\x06result\"_\n\x0fTranscriptChunk\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\x12\n\nis_partial\x18\x02 \x01(\x08\x12\x15\n\rstart_time_ms\x18\x03 \x01(\x03\x12\x13\n\x0b\x65nd_time_ms\x18\x04 \x01(\x03\"^\n\x0eSpeakerSegment\x12\x12\n\nspeaker_id\x18\x01 \x01(\t\x12\x12\n\nstart_time\x18\x02 \x01(\x02\x12\x10\n\x08\x65nd_time\x18\x03 \x01(\x02\x12\x12\n\nconfidence\x18\x04 \x01(\x02\"@\n\x0c\x45ntityUpdate\x12\x30\n\x08\x65ntities\x18\x01 \x03(\x0b\x32\x1e.audio_processor.MedicalEntity\"b\n\rMedicalEntity\x12\x13\n\x0b\x65ntity_type\x18\x01 \x01(\t\x12\x0c\n\x04text\x18\x02 \x01(\t\x12\r\n\x05start\x18\x03 \x01(\x05\x12\x0b\n\x03\x65nd\x18\x04 \x01(\x05\x12\x12\n\nconfidence\x18\x05 \x01(\x02\"/\n\x0cStatusUpdate\x12\r\n\x05stage\x18\x01 \x01(\t\x12\x10\n\x08progress\x18\x02 \x01(\x02\"G\n\x0eSoapNoteUpdate\x12\x0f\n\x07section\x18\x01 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x02 \x01(\t\x12\x13\n\x0bis_complete\x18\x03 \x01(\x08\"P\n\x11\x41udioBatchRequest\x12\x12\n\naudio_data\x18\x01 \x01(\x0c\x12\x12\n\nsession_id\x18\x02 \x01(\t\x12\x13\n\x0bsample_rate\x18\x03 \x01(\x05\"\xcf\x01\n\x15ProcessingResultBatch\x12\x12\n\ntranscript\x18\x01 \x01(\t\x12\x30\n\x08\x65ntities\x18\x02 \x03(\x0b\x32\x1e.audio_processor.MedicalEntity\x12\x39\n\x10speaker_segments\x18\x03 \x03(\x0b\x32\x1f.audio_processor.SpeakerSegment\x12\x11\n\tsoap_note\x18\x04 \x01(\t\x12\x12\n\nmodel_used\x18\x05 \x01(\t\x12\x0e\n\x06status\x18\x06 \x01(\t2\xcb\x01\n\x0e\x41udioProcessor\x12X\n\x12ProcessAudioStream\x12\x1b.audio_processor.AudioChunk\x1a!.audio_processor.ProcessingResult(\x01\x30\x01\x12_\n\x11ProcessAudioBatch\x12\".audio_processor.AudioBatchRequest\x1a&.audio_processor.ProcessingResultBatchb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x15\x61udio_processor.proto\x12\x0f\x61udio_processor\"p\n\nAudioChunk\x12\x12\n\naudio_data\x18\x01 \x01(\x0c\x12\x12\n\nsession_id\x18\x02 \x01(\t\x12\x13\n\x0bsample_rate\x18\x03 \x01(\x05\x12\x13\n\x0b\x63hunk_index\x18\x04 \x01(\x05\x12\x10\n\x08is_final\x18\x05 \x01(\x08\"\x84\x02\n\x10ProcessingResult\x12\x36\n\ntranscript\x18\x01 \x01(\x0b\x32 .audio_processor.TranscriptChunkH\x00\x12\x31\n\x07speaker\x18\x02 \x01(\x0b\x32\x1e.audio_processor.SpeakerUpdateH\x00\x12\x31\n\x08\x65ntities\x18\x03 \x01(\x0b\x32\x1d.audio_processor.EntityUpdateH\x00\x12\x34\n\tsoap_note\x18\x04 \x01(\x0b\x32\x1f.audio_processor.SoapNoteUpdateH\x00\x12\x12\n\nsession_id\x18\x06 \x01(\tB\x08\n\x06result\"B\n\rSpeakerUpdate\x12\x31\n\x08segments\x18\x01 \x03(\x0b\x32\x1f.audio_processor.SpeakerSegment\"_\n\x0fTranscriptChunk\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\x12\n\nis_partial\x18\x02 \x01(\x08\x12\x15\n\rstart_time_ms\x18\x03 \x01(\x03\x12\x13\n\x0b\x65nd_time_ms\x18\x04 \x01(\x03\"^\n\x0eSpeakerSegment\x12\x12\n\nspeaker_id\x18\x01 \x01(\t\x12\x12\n\nstart_time\x18\x02 \x01(\x02\x12\x10\n\x08\x65nd_time\x18\x03 \x01(\x02\x12\x12\n\nconfidence\x18\x04 \x01(\x02\"@\n\x0c\x45ntityUpdate\x12\x30\n\x08\x65ntities\x18\x01 \x03(\x0b\x32\x1e.audio_processor.MedicalEntity\"b\n\rMedicalEntity\x12\x13\n\x0b\x65ntity_type\x18\x01 \x01(\t\x12\x0c\n\x04text\x18\x02 \x01(\t\x12\r\n\x05start\x18\x03 \x01(\x05\x12\x0b\n\x03\x65nd\x18\x04 \x01(\x05\x12\x12\n\nconfidence\x18\x05 \x01(\x02\"/\n\x0cStatusUpdate\x12\r\n\x05stage\x18\x01 \x01(\t\x12\x10\n\x08progress\x18\x02 \x01(\x02\"G\n\x0eSoapNoteUpdate\x12\x0f\n\x07section\x18\x01 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x02 \x01(\t\x12\x13\n\x0bis_complete\x18\x03 \x01(\x08\"P\n\x11\x41udioBatchRequest\x12\x12\n\naudio_data\x18\x01 \x01(\x0c\x12\x12\n\nsession_id\x18\x02 \x01(\t\x12\x13\n\x0bsample_rate\x18\x03 \x01(\x05\"\xcf\x01\n\x15ProcessingResultBatch\x12\x12\n\ntranscript\x18\x01 \x01(\t\x12\x30\n\x08\x65ntities\x18\x02 \x03(\x0b\x32\x1e.audio_processor.MedicalEntity\x12\x39\n\x10speaker_segments\x18\x03 \x03(\x0b\x32\x1f.audio_processor.SpeakerSegment\x12\x11\n\tsoap_note\x18\x04 \x01(\t\x12\x12\n\nmodel_used\x18\x05 \x01(\t\x12\x0e\n\x06status\x18\x06 \x01(\t2\xcb\x01\n\x0e\x41udioProcessor\x12X\n\x12ProcessAudioStream\x12\x1b.audio_processor.AudioChunk\x1a!.audio_processor.ProcessingResult(\x01\x30\x01\x12_\n\x11ProcessAudioBatch\x12\".audio_processor.AudioBatchRequest\x1a&.audio_processor.ProcessingResultBatchb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -34,23 +34,25 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_AUDIOCHUNK']._serialized_start=42
   _globals['_AUDIOCHUNK']._serialized_end=154
   _globals['_PROCESSINGRESULT']._serialized_start=157
-  _globals['_PROCESSINGRESULT']._serialized_end=467
-  _globals['_TRANSCRIPTCHUNK']._serialized_start=469
-  _globals['_TRANSCRIPTCHUNK']._serialized_end=564
-  _globals['_SPEAKERSEGMENT']._serialized_start=566
-  _globals['_SPEAKERSEGMENT']._serialized_end=660
-  _globals['_ENTITYUPDATE']._serialized_start=662
-  _globals['_ENTITYUPDATE']._serialized_end=726
-  _globals['_MEDICALENTITY']._serialized_start=728
-  _globals['_MEDICALENTITY']._serialized_end=826
-  _globals['_STATUSUPDATE']._serialized_start=828
-  _globals['_STATUSUPDATE']._serialized_end=875
-  _globals['_SOAPNOTEUPDATE']._serialized_start=877
-  _globals['_SOAPNOTEUPDATE']._serialized_end=948
-  _globals['_AUDIOBATCHREQUEST']._serialized_start=950
-  _globals['_AUDIOBATCHREQUEST']._serialized_end=1030
-  _globals['_PROCESSINGRESULTBATCH']._serialized_start=1033
-  _globals['_PROCESSINGRESULTBATCH']._serialized_end=1240
-  _globals['_AUDIOPROCESSOR']._serialized_start=1243
-  _globals['_AUDIOPROCESSOR']._serialized_end=1446
+  _globals['_PROCESSINGRESULT']._serialized_end=417
+  _globals['_SPEAKERUPDATE']._serialized_start=419
+  _globals['_SPEAKERUPDATE']._serialized_end=485
+  _globals['_TRANSCRIPTCHUNK']._serialized_start=487
+  _globals['_TRANSCRIPTCHUNK']._serialized_end=582
+  _globals['_SPEAKERSEGMENT']._serialized_start=584
+  _globals['_SPEAKERSEGMENT']._serialized_end=678
+  _globals['_ENTITYUPDATE']._serialized_start=680
+  _globals['_ENTITYUPDATE']._serialized_end=744
+  _globals['_MEDICALENTITY']._serialized_start=746
+  _globals['_MEDICALENTITY']._serialized_end=844
+  _globals['_STATUSUPDATE']._serialized_start=846
+  _globals['_STATUSUPDATE']._serialized_end=893
+  _globals['_SOAPNOTEUPDATE']._serialized_start=895
+  _globals['_SOAPNOTEUPDATE']._serialized_end=966
+  _globals['_AUDIOBATCHREQUEST']._serialized_start=968
+  _globals['_AUDIOBATCHREQUEST']._serialized_end=1048
+  _globals['_PROCESSINGRESULTBATCH']._serialized_start=1051
+  _globals['_PROCESSINGRESULTBATCH']._serialized_end=1258
+  _globals['_AUDIOPROCESSOR']._serialized_start=1261
+  _globals['_AUDIOPROCESSOR']._serialized_end=1464
 # @@protoc_insertion_point(module_scope)
