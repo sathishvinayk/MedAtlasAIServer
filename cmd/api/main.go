@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	pb "MedAtlasAIServer/gen"
+
 	"github.com/gorilla/mux"
 	"github.com/qdrant/go-client/qdrant"
 	"google.golang.org/grpc"
@@ -38,6 +40,8 @@ type Server struct {
 	Embedder      *embeddingClient.Client
 	Sessions      map[string]*models.StreamingSession
 	SessionsMutex sync.RWMutex
+	Streams       map[string]pb.AudioProcessor_ProcessAudioStreamClient
+	StreamsMutex  sync.RWMutex
 }
 
 func main() {
@@ -62,6 +66,7 @@ func main() {
 		QdrantClient: qdrantClient,
 		Embedder:     embedder,
 		Sessions:     make(map[string]*models.StreamingSession),
+		Streams:      make(map[string]pb.AudioProcessor_ProcessAudioStreamClient),
 	}
 
 	// Routing
@@ -124,14 +129,25 @@ func (s *Server) startStreamingHandler(w http.ResponseWriter, r *http.Request) {
 
 	sessionID := generateSessionID()
 
-	s.SessionsMutex.Lock()
+	ctx := r.Context()
+	stream, err := s.Embedder.CreateStream(ctx, sessionID, 16000)
+	if err != nil {
+		http.Error(w, `{"error": "Failed to create stream"}`, http.StatusInternalServerError)
+		return
+	}
 
+	s.SessionsMutex.Lock()
 	s.Sessions[sessionID] = &models.StreamingSession{
 		SessionID: sessionID,
 		Status:    "active",
 		CreatedAt: time.Now().Unix(),
 	}
 	s.SessionsMutex.Unlock()
+
+	s.StreamsMutex.Lock()
+	s.Streams[sessionID] = stream
+	s.StreamsMutex.Unlock()
+
 	log.Printf("Started streaming session: %s", sessionID)
 
 	json.NewEncoder(w).Encode(map[string]string{
@@ -150,7 +166,6 @@ func (s *Server) processStreamingChunkHandler(w http.ResponseWriter, r *http.Req
 	var req models.StreamingAudioRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		log.Printf("❌ JSON decode error: %v", err)
-
 		http.Error(w, `{"error": "Invalid JSON"}`, http.StatusBadRequest)
 		return
 	}
@@ -163,52 +178,84 @@ func (s *Server) processStreamingChunkHandler(w http.ResponseWriter, r *http.Req
 		http.Error(w, `{"error": "Invalid or inactive session"}`, http.StatusBadRequest)
 		return
 	}
+
 	audioData, err := base64.StdEncoding.DecodeString(req.AudioChunk)
 	if err != nil {
+		log.Printf("❌ Audio decode error: %v", err)
 		http.Error(w, `{"error": "Invalid audio data"}`, http.StatusBadRequest)
 		return
 	}
-	// ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	ctx := r.Context() // Use request context instead of short timeout
-	// defer cancel()
 
-	audioChunks := make(chan []byte, 10)
+	log.Printf("Processing chunk %d, size: %d bytes, final: %t", req.ChunkIndex, len(audioData), req.IsFinal)
 
+	// Create a simple channel for this single chunk
+	audioChunks := make(chan []byte, 1)
+
+	// Send the chunk
+	audioChunks <- audioData
+	if req.IsFinal {
+		close(audioChunks)
+		log.Printf("Final chunk received, closing stream")
+	} else {
+		// Close the channel after sending for single-chunk processing
+		close(audioChunks)
+	}
+
+	ctx := r.Context()
 	resultChan, err := s.Embedder.ProcessAudioStream(ctx, req.SessionID, audioChunks, 16000)
 	if err != nil {
-		log.Printf("gRPC streaming error: %v", err)
+		log.Printf("❌ gRPC streaming error: %v", err)
 		http.Error(w, `{"error": "Streaming unavailable"}`, http.StatusServiceUnavailable)
 		return
 	}
 
-	go func() {
-		audioChunks <- audioData
-		if req.IsFinal {
-			close(audioChunks)
-		}
-	}()
-
 	var results []models.StreamingResult
-	for result := range resultChan {
-		results = append(results, *result)
-		switch result.Type {
-		case "transcript":
-			if text, ok := result.Data["text"].(string); ok {
-				session.CurrentTranscript += " " + text
+	timeout := time.After(30 * time.Second) // 30-second timeout
+
+	for {
+		select {
+		case result, ok := <-resultChan:
+			if !ok {
+				log.Printf("Result channel closed")
+				goto SendResponse
 			}
-		case "speaker":
-		case "entities":
-		case "soap_note":
-			if req.IsFinal {
-				session.Status = "completed"
+			if result != nil {
+				results = append(results, *result)
+				log.Printf("Received result type: %s", result.Type)
+
+				// Update session transcript
+				s.SessionsMutex.Lock()
+				if session, exists := s.Sessions[req.SessionID]; exists {
+					if result.Type == "transcript" {
+						if text, ok := result.Data["text"].(string); ok {
+							session.CurrentTranscript += " " + text
+							log.Printf("Updated transcript: %s", text)
+						}
+					}
+				}
+				s.SessionsMutex.Unlock()
 			}
+
+		case <-timeout:
+			log.Printf("Timeout waiting for results")
+			goto SendResponse
+
+		case <-ctx.Done():
+			log.Printf("Request context cancelled")
+			goto SendResponse
 		}
 	}
+
+SendResponse:
 	if req.IsFinal {
 		s.SessionsMutex.Lock()
-		session.Status = "completed"
+		if session, exists := s.Sessions[req.SessionID]; exists {
+			session.Status = "completed"
+			log.Printf("Session %s completed", req.SessionID)
+		}
 		s.SessionsMutex.Unlock()
 	}
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"session_id":  req.SessionID,
 		"status":      "processed",
@@ -216,6 +263,8 @@ func (s *Server) processStreamingChunkHandler(w http.ResponseWriter, r *http.Req
 		"is_final":    req.IsFinal,
 		"results":     results,
 	})
+
+	log.Printf("Sent response for chunk %d with %d results", req.ChunkIndex, len(results))
 }
 
 func (s *Server) websocketStreamHandler(w http.ResponseWriter, r *http.Request) {

@@ -96,64 +96,66 @@ class AudioProcessorService(audio_processor_pb2_grpc.AudioProcessorServicer):
         self.sessions = {}
     
     async def ProcessAudioStream(self, request_iterator: AsyncIterator, context):
-        logger.info(f"gRPC stream connection established, waiting for chunks...")
         session_id = None
-        audio_buffer = []  # Keep the buffer for better processing
-
+        
         try:
+            logger.info("🔵 gRPC stream connection established, waiting for chunks...")
+            
             async for chunk in request_iterator:
+                logger.info(f"🔵 Received chunk {chunk.chunk_index}, size: {len(chunk.audio_data)} bytes, final: {chunk.is_final}")
+                
                 if not session_id:
                     session_id = chunk.session_id
                     self.sessions[session_id] = {
-                        'audio_buffer': [],
                         'transcript_parts': [],
                         'start_time': asyncio.get_event_loop().time()
                     }
-                    logger.info(f"Started gRPC streaming session: {session_id}")
-                
-                audio_buffer.append(chunk.audio_data)
+                    logger.info(f"🔵 Started gRPC streaming session: {session_id}")
 
-                if len(audio_buffer) >= 5 or chunk.is_final: 
-                    combined_audio = b''.join(audio_buffer)
-                
-                    results = await self._process_streaming_chunk(
-                        session_id, combined_audio, chunk.is_final
-                    )
-
-                    audio_buffer = []
-                    for result in results:
-                        yield result
-
-                if chunk.is_final:
-                    logger.info(f"Final chunk received for session {session_id}")
-                    break
-        except Exception as e:
-            logger.error(f"gRPC stream processing error: {e}")
-            yield audio_processor_pb2.ProcessingResult(
-                session_id=session_id or "unknown",
-                status=audio_processor_pb2.StatusUpdate(
-                    stage="error",
-                    progress=0.0
+                # Process each chunk immediately
+                results = await self._process_streaming_chunk(
+                    session_id, chunk.audio_data, chunk.is_final
                 )
-            )
+                
+                # Send results back
+                for result in results:
+                    logger.info(f"🟢 Sending result type: {result.WhichOneof('result')} for session {session_id}")
+                    yield result
+                    
+                if chunk.is_final:
+                    logger.info(f"🔵 Final chunk received for session {session_id}")
+                    break
+                    
+        except Exception as e:
+            logger.error(f"🔴 gRPC stream processing error: {e}", exc_info=True)
         finally:
-            if session_id in self.sessions:
+            if session_id and session_id in self.sessions:
                 del self.sessions[session_id]
+                logger.info(f"🔵 Cleaned up session: {session_id}")
     
     async def _process_streaming_chunk(self, session_id: str, audio_data: bytes, is_final: bool = False):
         results = []
         try:
+            if len(audio_data) == 0:
+                logger.warning("🟡 Received empty audio data")
+                return results
+                
+            logger.info(f"🔵 Processing audio chunk, size: {len(audio_data)} bytes")
+            
             with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
                 tmp_file.write(audio_data)
                 audio_path = tmp_file.name
+            logger.info(f"🔵 Created temp file: {audio_path}")
             
             # Transcription
             if WHISPER_MODEL:
+                logger.info("🔵 Starting Whisper transcription...")
                 transcript = await asyncio.get_event_loop().run_in_executor(
                     WHISPER_POOL,
                     lambda: WHISPER_MODEL.transcribe(audio_path)
                 )
                 transcript_text = transcript.get("text", "").strip()
+                logger.info(f"🔵 Whisper transcription result: '{transcript_text}'")
 
                 if transcript_text:
                     if 'transcript_parts' not in self.sessions[session_id]:
@@ -169,6 +171,8 @@ class AudioProcessorService(audio_processor_pb2_grpc.AudioProcessorServicer):
                             end_time_ms=2000,
                         )
                     ))
+                    logger.info(f"🟢 Generated transcript result")
+
             # Diarizations
             current_transcript = ' '.join(self.sessions[session_id].get('transcript_parts', []))
             if is_final and PYANNOTE_PIPELINE and len(audio_data) > 10000:
@@ -234,10 +238,12 @@ class AudioProcessorService(audio_processor_pb2_grpc.AudioProcessorServicer):
                 ))
         
             os.unlink(audio_path)
+            logger.info(f"🔵 Cleaned up temp file")
         
         except Exception as e:
             logger.error(f"Streaming chunk processing error: {e}")
         
+        logger.info(f"🔵 Returning {len(results)} results")
         return results
 
 async def start_grpc_server():
