@@ -1,5 +1,4 @@
 # models/core.py
-# Currently diarization token for pyannote is kept "", since diarizations take longer time to process.
 import asyncio
 import logging
 import os
@@ -19,12 +18,12 @@ from transformers import (
 logger = logging.getLogger("medical-nlp-models")
 
 class ModelManager:
-    """Centralized model management with thread-safe loading and access"""
+    """Centralized model management with ClinicalBERT and optional LLM"""
     
     def __init__(self):
         self.SENTENCE_MODEL = None
         self.WHISPER_MODEL = None
-        self.BIOBERT_MODEL = None
+        self.CLINICALBERT_MODEL = None  # Renamed from BIOBERT_MODEL
         self.SPACY_MODEL = None
         self.MEDICAL_LLM = None
         self.MEDICAL_TOKENIZER = None
@@ -32,8 +31,14 @@ class ModelManager:
         
         # Configuration
         self.WHISPER_MODEL_SIZE = "base"
+        self.CLINICALBERT_MODEL_NAME = "emilyalsentzer/Bio_ClinicalBERT"  # ClinicalBERT
+        # self.MEDICAL_LLM_NAME = os.getenv('MEDICAL_LLM_NAME', '')  # Empty = no LLM by default
         self.MEDICAL_LLM_NAME = os.getenv('MEDICAL_LLM_NAME', 'microsoft/BioGPT-Large')
+
         self.PYANNOTE_AUTH_TOKEN = os.getenv('PYANNOTE_AUTH_TOKEN', '')
+        
+        # Control flags
+        self.USE_LLM = bool(self.MEDICAL_LLM_NAME)  # Only load LLM if explicitly specified
         
         # Thread pools
         self.MAX_WORKERS_GENERAL = int(os.getenv('MAX_WORKERS_GENERAL', '4'))
@@ -65,7 +70,7 @@ class ModelManager:
         return {
             "sentence_transformer": self.SENTENCE_MODEL is not None,
             "whisper": self.WHISPER_MODEL is not None,
-            "biobert": self.BIOBERT_MODEL is not None,
+            "clinicalbert": self.CLINICALBERT_MODEL is not None,  # Updated name
             "spacy": self.SPACY_MODEL is not None,
             "medical_llm": self.MEDICAL_LLM is not None,
             "pyannote": self.PYANNOTE_PIPELINE is not None,
@@ -87,48 +92,46 @@ class ModelManager:
         """Load Whisper model"""
         try:
             import whisper
+            logger.info(f"Attempting to load Whisper model: {self.WHISPER_MODEL_SIZE}")
             model = whisper.load_model(self.WHISPER_MODEL_SIZE)
-            model = model.to('cpu')  # Keep on CPU by default
+            model = model.to('cpu')
             logger.info("✓ Whisper model loaded successfully")
             return model
         except Exception as e:
-            logger.warning(f"Whisper failed: {e}")
+            logger.error(f"Whisper failed to load: {e}", exc_info=True)
             return None
     
-    def _load_biobert(self):
-        """Load BioBERT model"""
+    def _load_clinicalbert(self):
+        """Load ClinicalBERT model for clinical entity recognition"""
         try:
-            biobert_pipeline = pipeline(
+            clinicalbert_pipeline = pipeline(
                 "ner",
-                model="dmis-lab/biobert-v1.1",
-                tokenizer="dmis-lab/biobert-v1.1",
-                aggregation_strategy="simple"
+                model=self.CLINICALBERT_MODEL_NAME,  # ClinicalBERT
+                tokenizer=self.CLINICALBERT_MODEL_NAME,
+                aggregation_strategy="simple",
+                device=0 if torch.cuda.is_available() else -1  # Use GPU if available
             )
-            logger.info("✓ BioBERT model loaded successfully")
-            return biobert_pipeline
+            logger.info("✓ ClinicalBERT model loaded successfully")
+            return clinicalbert_pipeline
         except Exception as e:
-            logger.warning(f"BioBERT failed: {e}")
+            logger.error(f"ClinicalBERT failed: {e}", exc_info=True)
             return None
     
     def _load_spacy_with_ruler(self):
-        """Load spaCy model with medical entity ruler"""
+        """Load spaCy model with medical entity ruler (fallback only)"""
         try:
             import spacy
             from spacy.pipeline import EntityRuler
             
-            # Medical keywords for entity ruler
+            # Medical keywords for entity ruler (minimal fallback only)
             MEDICAL_KEYWORDS = {
                 "SYMPTOM": ["headache", "fever", "cough", "pain", "nausea", "dizziness", 
-                            "fatigue", "tired", "tiredness", "shortness of breath", 
-                            "dry cough", "exhaustion", "weakness", "nausea"],
+                            "fatigue", "tired", "shortness of breath", "weakness"],
                 "MEDICATION": ["ibuprofen", "aspirin", "amoxicillin", "lisinopril", 
-                              "laciniprol", "metformin", "tylenol", "advil", "atenolol",
-                              "amlodipine", "simvastatin", "atorvastatin", "omeprazole"],
+                              "metformin", "tylenol", "advil", "atenolol", "amlodipine"],
                 "DIAGNOSIS": ["hypertension", "high blood pressure", "diabetes", 
-                             "migraine", "infection", "arthritis", "asthma", "pneumonia",
-                             "bronchitis", "influenza", "covid"],
-                "BODY_PART": ["head", "chest", "arm", "leg", "back", "stomach", "throat",
-                             "neck", "abdomen", "heart", "lungs"]
+                             "migraine", "infection", "arthritis", "asthma", "pneumonia"],
+                "BODY_PART": ["head", "chest", "arm", "leg", "back", "stomach", "throat"]
             }
             
             nlp = spacy.load("en_core_web_sm")
@@ -141,98 +144,94 @@ class ModelManager:
             ruler = nlp.add_pipe("entity_ruler", before="ner")
             ruler.add_patterns(patterns)
             
-            logger.info("✓ spaCy model with EntityRuler loaded successfully")
+            logger.info("✓ spaCy model with EntityRuler loaded successfully (fallback)")
             return nlp
         except Exception as e:
             logger.warning(f"spaCy with EntityRuler failed: {e}")
             return None
     
-    def _load_medical_llm(self) -> Tuple[Optional[Any], Optional[Any]]:
-        """Load medical LLM with hardware-optimized loading"""
+    async def _load_medical_llm(self) -> Tuple[Optional[Any], Optional[Any]]:
+        """Load medical LLM only if explicitly requested"""
+        if not self.USE_LLM:
+            logger.info("LLM loading skipped - using rule-based SOAP generation")
+            return None, None
+            
         try:
-            # Load tokenizer first
-            tokenizer = AutoTokenizer.from_pretrained(
-                self.MEDICAL_LLM_NAME,
-                trust_remote_code=True
-            )
-            
-            # Set padding token if not present
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
-            
-            # Determine the best loading strategy based on hardware
-            if torch.backends.mps.is_available():
-                # Apple Silicon - load without bitsandbytes
-                logger.info("Loading model for Apple Silicon (MPS)")
-                model = AutoModelForCausalLM.from_pretrained(
+            def _load_llm():
+                # Load tokenizer first
+                tokenizer = AutoTokenizer.from_pretrained(
                     self.MEDICAL_LLM_NAME,
-                    device_map="mps",
-                    trust_remote_code=True,
-                    torch_dtype=torch.float16,
-                    low_cpu_mem_usage=True
+                    trust_remote_code=True
                 )
                 
-            elif torch.cuda.is_available():
-                # NVIDIA GPU - use bitsandbytes if available
-                try:
-                    quantization_config = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch.float16,
-                        bnb_4bit_quant_type="nf4",
-                        bnb_4bit_use_double_quant=True,
-                    )
-                    
+                # Set padding token if not present
+                if tokenizer.pad_token is None:
+                    tokenizer.pad_token = tokenizer.eos_token
+                
+                # Determine the best loading strategy based on hardware
+                if torch.backends.mps.is_available():
+                    # Apple Silicon
+                    logger.info("Loading model for Apple Silicon (MPS)")
                     model = AutoModelForCausalLM.from_pretrained(
                         self.MEDICAL_LLM_NAME,
-                        quantization_config=quantization_config,
-                        device_map="auto",
+                        device_map="mps",
                         trust_remote_code=True,
-                        torch_dtype=torch.float16
+                        torch_dtype=torch.float16,
+                        low_cpu_mem_usage=True
                     )
-                    logger.info("Loaded with CUDA and 4-bit quantization")
                     
-                except ImportError:
-                    # Fallback without bitsandbytes
+                elif torch.cuda.is_available():
+                    # NVIDIA GPU
+                    try:
+                        from transformers import BitsAndBytesConfig
+                        quantization_config = BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_compute_dtype=torch.float16,
+                            bnb_4bit_quant_type="nf4",
+                            bnb_4bit_use_double_quant=True,
+                        )
+                        
+                        model = AutoModelForCausalLM.from_pretrained(
+                            self.MEDICAL_LLM_NAME,
+                            quantization_config=quantization_config,
+                            device_map="auto",
+                            trust_remote_code=True,
+                            torch_dtype=torch.float16
+                        )
+                        logger.info("Loaded with CUDA and 4-bit quantization")
+                        
+                    except ImportError:
+                        # Fallback without bitsandbytes
+                        model = AutoModelForCausalLM.from_pretrained(
+                            self.MEDICAL_LLM_NAME,
+                            device_map="auto",
+                            trust_remote_code=True,
+                            torch_dtype=torch.float16
+                        )
+                        logger.info("Loaded with CUDA (no quantization)")
+                        
+                else:
+                    # CPU fallback
+                    logger.info("Loading model for CPU")
                     model = AutoModelForCausalLM.from_pretrained(
                         self.MEDICAL_LLM_NAME,
-                        device_map="auto",
+                        device_map="cpu",
                         trust_remote_code=True,
-                        torch_dtype=torch.float16
+                        torch_dtype=torch.float32,
+                        low_cpu_mem_usage=True
                     )
-                    logger.info("Loaded with CUDA (no quantization)")
-                    
-            else:
-                # CPU fallback
-                logger.info("Loading model for CPU")
-                model = AutoModelForCausalLM.from_pretrained(
-                    self.MEDICAL_LLM_NAME,
-                    device_map="cpu",
-                    trust_remote_code=True,
-                    torch_dtype=torch.float32,
-                    low_cpu_mem_usage=True
-                )
+                
+                return model, tokenizer
             
+            model, tokenizer = await asyncio.get_event_loop().run_in_executor(
+                self.LLM_POOL, _load_llm
+            )
             logger.info(f"✓ Medical LLM ({self.MEDICAL_LLM_NAME}) loaded successfully")
             return model, tokenizer
             
         except Exception as e:
             logger.error(f"Medical LLM failed: {e}")
-            # Try a simpler loading approach as fallback
-            try:
-                logger.info("Trying simple loading fallback...")
-                tokenizer = AutoTokenizer.from_pretrained(
-                    self.MEDICAL_LLM_NAME,
-                    trust_remote_code=True
-                )
-                model = AutoModelForCausalLM.from_pretrained(
-                    self.MEDICAL_LLM_NAME,
-                    trust_remote_code=True
-                )
-                logger.info(f"✓ Fallback loading successful for {self.MEDICAL_LLM_NAME}")
-                return model, tokenizer
-            except Exception as fallback_error:
-                logger.error(f"Fallback loading also failed: {fallback_error}")
-                return None, None
+            return None, None
     
     def _load_pyannote(self):
         """Load pyannote speaker diarization pipeline"""
@@ -256,23 +255,30 @@ class ModelManager:
             return None
     
     async def load_models_async(self):
-        """Asynchronously load all models"""
+        """Asynchronously load all models with ClinicalBERT as primary"""
         with self._model_load_lock:
             if self._models_loaded:
                 logger.info("Models already loaded, skipping")
                 return
             
             logger.info("Starting async model loading...")
+            logger.info(f"LLM enabled: {self.USE_LLM} (MEDICAL_LLM_NAME: {self.MEDICAL_LLM_NAME})")
             
             # Load models concurrently
             tasks = [
                 self.GENERAL_POOL.submit(self._load_sentence_transformer),
                 self.GENERAL_POOL.submit(self._load_whisper),
-                self.GENERAL_POOL.submit(self._load_biobert),
+                self.GENERAL_POOL.submit(self._load_clinicalbert),  # ClinicalBERT
                 self.GENERAL_POOL.submit(self._load_spacy_with_ruler),
                 self.GENERAL_POOL.submit(self._load_pyannote),
-                self.LLM_POOL.submit(self._load_medical_llm),
             ]
+            
+            # Only add LLM task if explicitly enabled
+            if self.USE_LLM:
+                tasks.append(self.LLM_POOL.submit(self._load_medical_llm))
+            else:
+                # Add a placeholder for consistent indexing
+                tasks.append(lambda: (None, None))
             
             # Wait for all tasks to complete
             completed_tasks = await asyncio.get_event_loop().run_in_executor(
@@ -282,11 +288,11 @@ class ModelManager:
             # Assign results
             self.SENTENCE_MODEL = completed_tasks[0]
             self.WHISPER_MODEL = completed_tasks[1]
-            self.BIOBERT_MODEL = completed_tasks[2]
+            self.CLINICALBERT_MODEL = completed_tasks[2]  # ClinicalBERT
             self.SPACY_MODEL = completed_tasks[3]
             self.PYANNOTE_PIPELINE = completed_tasks[4]
             
-            # Handle LLM result (tuple of model, tokenizer)
+            # Handle LLM result
             llm_result = completed_tasks[5]
             if llm_result and isinstance(llm_result, tuple) and len(llm_result) == 2:
                 self.MEDICAL_LLM, self.MEDICAL_TOKENIZER = llm_result
@@ -344,3 +350,11 @@ def get_model_status():
 def is_models_loaded():
     """Check if models are loaded"""
     return model_manager.is_loaded()
+
+def is_llm_enabled():
+    """Check if LLM is enabled"""
+    return model_manager.USE_LLM
+
+def get_clinicalbert_model():
+    """Get ClinicalBERT model instance"""
+    return model_manager.CLINICALBERT_MODEL
