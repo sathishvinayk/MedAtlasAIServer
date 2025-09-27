@@ -188,18 +188,38 @@ func (s *Server) processStreamingChunkHandler(w http.ResponseWriter, r *http.Req
 
 	log.Printf("Processing chunk %d, size: %d bytes, final: %t", req.ChunkIndex, len(audioData), req.IsFinal)
 
-	// Create a simple channel for this single chunk
-	audioChunks := make(chan []byte, 1)
+	// Store the chunk in the session
+	s.SessionsMutex.Lock()
+	session.AudioChunks = append(session.AudioChunks, audioData)
+	s.SessionsMutex.Unlock()
 
-	// Send the chunk
-	audioChunks <- audioData
-	if req.IsFinal {
-		close(audioChunks)
-		log.Printf("Final chunk received, closing stream")
-	} else {
-		// Close the channel after sending for single-chunk processing
-		close(audioChunks)
+	// For non-final chunks, return immediately with empty results
+	if !req.IsFinal {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"session_id":  req.SessionID,
+			"status":      "buffered",
+			"chunk_index": req.ChunkIndex,
+			"is_final":    req.IsFinal,
+			"results":     []models.StreamingResult{},
+		})
+		log.Printf("Buffered chunk %d, waiting for final chunk", req.ChunkIndex)
+		return
 	}
+
+	// For final chunk, process all buffered audio
+	log.Printf("Final chunk received, processing all buffered audio")
+
+	s.SessionsMutex.RLock()
+	allChunks := make([][]byte, len(session.AudioChunks))
+	copy(allChunks, session.AudioChunks)
+	s.SessionsMutex.RUnlock()
+
+	// Create channel and send all chunks
+	audioChunks := make(chan []byte, len(allChunks)+1)
+	for _, chunk := range allChunks {
+		audioChunks <- chunk
+	}
+	close(audioChunks) // This will trigger the final signal in the client
 
 	ctx := r.Context()
 	resultChan, err := s.Embedder.ProcessAudioStream(ctx, req.SessionID, audioChunks, 16000)
@@ -210,7 +230,7 @@ func (s *Server) processStreamingChunkHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	var results []models.StreamingResult
-	timeout := time.After(30 * time.Second) // 30-second timeout
+	timeout := time.After(60 * time.Second) // 60-second timeout for processing
 
 	for {
 		select {
@@ -247,14 +267,14 @@ func (s *Server) processStreamingChunkHandler(w http.ResponseWriter, r *http.Req
 	}
 
 SendResponse:
-	if req.IsFinal {
-		s.SessionsMutex.Lock()
-		if session, exists := s.Sessions[req.SessionID]; exists {
-			session.Status = "completed"
-			log.Printf("Session %s completed", req.SessionID)
-		}
-		s.SessionsMutex.Unlock()
+	// Clear the buffer and mark session as completed
+	s.SessionsMutex.Lock()
+	if session, exists := s.Sessions[req.SessionID]; exists {
+		session.AudioChunks = nil // Clear buffer
+		session.Status = "completed"
+		log.Printf("Session %s completed with %d results", req.SessionID, len(results))
 	}
+	s.SessionsMutex.Unlock()
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"session_id":  req.SessionID,
@@ -264,7 +284,7 @@ SendResponse:
 		"results":     results,
 	})
 
-	log.Printf("Sent response for chunk %d with %d results", req.ChunkIndex, len(results))
+	log.Printf("Sent response for final chunk with %d results", len(results))
 }
 
 func (s *Server) websocketStreamHandler(w http.ResponseWriter, r *http.Request) {

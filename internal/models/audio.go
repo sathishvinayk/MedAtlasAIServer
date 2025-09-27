@@ -15,9 +15,9 @@ type StreamingResult struct {
 }
 
 type StreamingSession struct {
-	SessionID         string `json:"session_id"`
-	Status            string `json:"status"`
-	AudioChunks       [][]byte
+	SessionID         string   `json:"session_id"`
+	Status            string   `json:"status"`
+	AudioChunks       [][]byte `json:"-"`
 	CurrentTranscript string
 	SpeakerSegments   []SpeakerSegment
 	Entities          []MedicalEntity
