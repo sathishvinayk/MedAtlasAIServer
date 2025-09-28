@@ -1,4 +1,4 @@
-r"""
+"""
 Purpose: Perform the machine learning magic.
 
 Service: asr-service (Automatic Speech Recognition)
@@ -57,7 +57,7 @@ from transformers import (
     GenerationConfig,
     BitsAndBytesConfig
 )
-from utils import normalize_medication_name, truncate_text, get_audio_duration, map_spacy_label_to_medical, universal_embedding, universal_transcript, temp_audio_file
+from utils import normalize_medication_name, truncate_text, get_audio_duration, map_spacy_label_to_medical, universal_embedding, universal_transcript, temp_audio_file, map_biobert_label_to_medical, align_transcription_with_speakers
 from soap_generator import generate_soap_note_rule_based
 from entities import MedicalEntity, SpeakerSegment, EmbedRequest, EmbedResponse, ProcessAudioRequest, ProcessAudioResponse
 from entity_extractor import extract_entities_keywords, deduplicate_entities, filter_negated_entities
@@ -164,59 +164,6 @@ def perform_diarization(audio_path: str) -> List[SpeakerSegment]:
         logger.error(f"Pyannote diarization failed: {e}")
         return []
 
-# Add function to align transcription with speaker segments
-def align_transcription_with_speakers(transcript: str, speaker_segments: List[SpeakerSegment], audio_duration: float) -> List[SpeakerSegment]:
-    """Align Whisper transcription with speaker segments"""
-    if not speaker_segments or not transcript:
-        return speaker_segments
-    
-    # Simple approach: split transcript by sentences and assign to speakers based on time
-    sentences = transcript.split('. ')
-    total_chars = len(transcript)
-    
-    # Calculate character rate (chars per second)
-    if audio_duration > 0:
-        char_rate = total_chars / audio_duration
-    else:
-        # Fallback: assume 10 characters per second
-        char_rate = 10
-    
-    # Assign text to segments based on timing
-    for segment in speaker_segments:
-        segment_duration = segment.end - segment.start
-        expected_chars = int(segment_duration * char_rate)
-        
-        # This is a simplified approach - in production, you'd want a more sophisticated alignment
-        segment.text = f"Speaker {segment.speaker} segment from {segment.start}s to {segment.end}s"
-    
-    return speaker_segments
-
-# Model mapping functions (unchanged)
-def map_biobert_label_to_medical(label: str, token_text: str) -> str:
-    """Enhanced BioBERT label mapping"""
-    label_upper = label.upper()
-    token_lower = token_text.lower()
-    
-    # Enhanced mapping for BioBERT labels
-    if any(x in label_upper for x in ["DISEASE", "DIAG", "CONDITION", "PROBLEM"]):
-        return "DIAGNOSIS"
-    if any(x in label_upper for x in ["CHEM", "DRUG", "MED", "TREATMENT"]):
-        return "MEDICATION"
-    if any(x in label_upper for x in ["SYMPTOM", "SIGN", "COMPLAINT"]):
-        return "SYMPTOM"
-    if any(x in label_upper for x in ["ANATOMY", "BODY", "LOC", "ORGAN"]):
-        return "BODY_PART"
-    
-    # Check medication synonyms
-    if token_lower in MEDICATION_SYNONYMS:
-        return "MEDICATION"
-    
-    # Fallback to keyword matching
-    for ent_type, keywords in MEDICAL_KEYWORDS.items():
-        if token_lower in keywords:
-            return ent_type
-    
-    return "OTHER"
 
 # Load spaCy with EntityRuler (unchanged)
 def load_spacy_with_ruler():
