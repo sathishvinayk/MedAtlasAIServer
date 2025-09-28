@@ -18,10 +18,10 @@ from transformers import (
     AutoTokenizer, 
     AutoModelForCausalLM, 
 )
-from utils import normalize_medication_name, truncate_text, get_audio_duration, map_spacy_label_to_medical, universal_embedding, universal_transcript, temp_audio_file, map_biobert_label_to_medical, align_transcription_with_speakers
+from utils import normalize_medication_name, truncate_text, get_audio_duration, map_spacy_label_to_medical, universal_transcript, temp_audio_file, map_biobert_label_to_medical, align_transcription_with_speakers
 from soap_generator import generate_soap_note_rule_based
-from entities import MedicalEntity, SpeakerSegment, EmbedRequest, EmbedResponse, ProcessAudioRequest, ProcessAudioResponse
-from entity_extractor import extract_entities_keywords, deduplicate_entities, filter_negated_entities
+from entities import MedicalEntity, SpeakerSegment, ProcessAudioRequest, ProcessAudioResponse
+from entity_extractor import extract_entities_keywords, deduplicate_entities, filter_negated_entities, extract_medication_changes, extract_medical_patterns
 from constants import MEDICAL_KEYWORDS
 from config import WHISPER_MODEL_SIZE, MEDICAL_LLM_NAME, PYANNOTE_AUTH_TOKEN
 
@@ -154,6 +154,12 @@ def extract_medical_entities_sync(text: str) -> Tuple[List[MedicalEntity], str]:
     model_used = "keyword-fallback"
     
     global BIOBERT_MODEL, SPACY_MODEL
+
+    pattern_entities = extract_medical_patterns(text)
+    change_entities = extract_medication_changes(text)
+    entities.extend(pattern_entities)
+    entities.extend(change_entities)
+    
     
     # PRIMARY: spaCy with enhanced patterns (SWITCHED TO PRIMARY)
     if SPACY_MODEL is not None:
@@ -335,15 +341,15 @@ async def load_models_async():
         
         async def load_sentence_transformer():
             try:
-                def _load_st():
-                    from sentence_transformers import SentenceTransformer
-                    return SentenceTransformer('all-MiniLM-L6-v2')
+                # def _load_st():
+                #     from sentence_transformers import SentenceTransformer
+                #     return SentenceTransformer('all-MiniLM-L6-v2')
                 
-                model = await asyncio.get_event_loop().run_in_executor(
-                    GENERAL_POOL, _load_st
-                )
-                logger.info("✓ SentenceTransformer loaded successfully")
-                return model
+                # model = await asyncio.get_event_loop().run_in_executor(
+                #     GENERAL_POOL, _load_st
+                # )
+                logger.info("✓ SentenceTransformer not loaded")
+                # return model
             except Exception as e:
                 logger.warning(f"SentenceTransformer failed: {e}")
                 return None
@@ -694,41 +700,6 @@ async def process_audio(request: ProcessAudioRequest):
             status="error",
             error=f"Processing failed: {str(e)}",
             request_id=request_id
-        )
-
-# Other endpoints remain unchanged
-@app.post("/embed", response_model=EmbedResponse)
-async def embed_text(request: EmbedRequest):
-    try:
-        if SENTENCE_MODEL is not None:
-            vector = await asyncio.get_event_loop().run_in_executor(
-                SENTENCE_POOL, 
-                SENTENCE_MODEL.encode, request.text
-            )
-            vector = vector.tolist() if hasattr(vector, 'tolist') else list(vector)
-            model_name = "all-MiniLM-L6-v2"
-        else:
-            vector = await asyncio.get_event_loop().run_in_executor(
-                GENERAL_POOL, 
-                universal_embedding, request.text
-            )
-            model_name = "universal-fallback"
-        
-        return EmbedResponse(
-            vector=vector,
-            model=model_name,
-            dims=len(vector)
-        )
-    except Exception as e:
-        logger.error(f"Embedding failed: {e}")
-        vector = await asyncio.get_event_loop().run_in_executor(
-            GENERAL_POOL, 
-            universal_embedding, request.text
-        )
-        return EmbedResponse(
-            vector=vector,
-            model="error-fallback",
-            dims=len(vector)
         )
 
 @app.get("/health")

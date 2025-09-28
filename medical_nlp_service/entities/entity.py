@@ -18,14 +18,6 @@ class SpeakerSegment(BaseModel):
     end: float = Field(..., description="End time in seconds")
     text: str = Field(..., description="Transcribed text for this segment")
 
-class EmbedRequest(BaseModel):
-    text: str = Field(..., min_length=1, description="Text to generate embedding for")
-
-class EmbedResponse(BaseModel):
-    vector: List[float] = Field(..., description="Embedding vector")
-    model: str = Field(..., description="Model used for embedding")
-    dims: int = Field(..., description="Dimension of the embedding vector")
-
 class ProcessAudioRequest(BaseModel):
     audio_data: str = Field(..., min_length=100, description="Base64 encoded audio data")
     file_name: str = Field(..., description="Original filename")

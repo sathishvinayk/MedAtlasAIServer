@@ -1,11 +1,9 @@
 # models/__init__.py
-from .entity import MedicalEntity, SpeakerSegment, EmbedRequest, EmbedResponse, ProcessAudioRequest, ProcessAudioResponse
+from .entity import MedicalEntity, SpeakerSegment, ProcessAudioRequest, ProcessAudioResponse
 
 __all__ = [
     'MedicalEntity',
     'SpeakerSegment',
-    'EmbedRequest',
-    'EmbedResponse',
     'ProcessAudioRequest',
     'ProcessAudioResponse'
 ]

@@ -112,3 +112,68 @@ def filter_negated_entities(transcript: str, entities: List[MedicalEntity]) -> L
             logger.info(f"Filtered out negated entity: {entity.text}")
     
     return filtered_entities
+
+def extract_medical_patterns(text: str) -> List[MedicalEntity]:
+    """Enhanced pattern matching for structured clinical data"""
+    entities = []
+    
+    # Blood pressure patterns
+    bp_patterns = [
+        r'blood pressure.*?(\d+)\s*\/\s*over\s*(\d+)',
+        r'(\d+)\s*over\s*(\d+).*?blood pressure',
+        r'bp.*?(\d+)\s*\/\s*(\d+)'
+    ]
+    
+    for pattern in bp_patterns:
+        for match in re.finditer(pattern, text.lower()):
+            entities.append(MedicalEntity(
+                entity="VITAL_SIGN",
+                text=f"BP {match.group(1)}/{match.group(2)}",
+                start=match.start(),
+                end=match.end(),
+                confidence=0.95
+            ))
+    
+    # Heart rate patterns
+    hr_patterns = [
+        r'heart rate.*?(\d+)',
+        r'pulse.*?(\d+)',
+        r'hr.*?(\d+)'
+    ]
+    
+    for pattern in hr_patterns:
+        for match in re.finditer(pattern, text.lower()):
+            entities.append(MedicalEntity(
+                entity="VITAL_SIGN", 
+                text=f"HR {match.group(1)}",
+                start=match.start(),
+                end=match.end(),
+                confidence=0.9
+            ))
+    
+    return entities
+
+def extract_medication_changes(text: str) -> List[MedicalEntity]:
+    """Detect medication start/stop/switch actions"""
+    entities = []
+    
+    # Medication action patterns
+    change_patterns = [
+        (r'start.*?(losartan|lisinopril|metformin|amlodipine)', "MEDICATION_START"),
+        (r'stop.*?(losartan|lisinopril|metformin|amlodipine)', "MEDICATION_STOP"), 
+        (r'switch.*?to.*?(losartan|lisinopril|metformin|amlodipine)', "MEDICATION_SWITCH"),
+        (r'change.*?to.*?(losartan|lisinopril|metformin|amlodipine)', "MEDICATION_SWITCH"),
+        (r'discontinue.*?(losartan|lisinopril|metformin|amlodipine)', "MEDICATION_STOP"),
+    ]
+    
+    for pattern, action in change_patterns:
+        for match in re.finditer(pattern, text.lower()):
+            entities.append(MedicalEntity(
+                entity=action,
+                text=match.group(0),
+                start=match.start(),
+                end=match.end(),
+                confidence=0.9
+            ))
+    
+    return entities

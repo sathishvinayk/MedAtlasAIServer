@@ -1055,42 +1055,6 @@ class RealTimeMedicalProcessor:
         
         return final_entities
 
-    def _map_biobert_label_to_medical(self, label: str, token_text: str) -> str:
-        """Map BioBERT labels to medical categories"""
-        label_upper = label.upper()
-        
-        if any(x in label_upper for x in ["DISEASE", "DIAG", "CONDITION"]):
-            return "DIAGNOSIS"
-        if any(x in label_upper for x in ["CHEM", "DRUG", "MED"]):
-            return "MEDICATION"
-        if any(x in label_upper for x in ["SYMPTOM", "SIGN"]):
-            return "SYMPTOM"
-        if any(x in label_upper for x in ["ANATOMY", "BODY", "LOC"]):
-            return "BODY_PART"
-        
-        token_lower = token_text.lower()
-        for ent_type, keywords in MEDICAL_KEYWORDS.items():
-            if token_lower in keywords:
-                return ent_type
-        
-        return "OTHER"
-
-    def _map_spacy_label_to_medical(self, label: str) -> str:
-        """Map spaCy labels to medical categories"""
-        mapping = {
-            "DISEASE": "DIAGNOSIS",
-            "CONDITION": "DIAGNOSIS",
-            "SYMPTOM": "SYMPTOM",
-            "MEDICATION": "MEDICATION",
-            "DRUG": "MEDICATION",
-            "BODY_PART": "BODY_PART",
-            "ORG": "ORGANIZATION",
-            "PERSON": "PERSON",
-            "DATE": "DATE",
-            "TIME": "TIME"
-        }
-        return mapping.get(label, "OTHER")
-
     async def _validate_comprehensive_medical_content(self, 
                                                     patient_context: PatientContext,
                                                     transcript: str, 
