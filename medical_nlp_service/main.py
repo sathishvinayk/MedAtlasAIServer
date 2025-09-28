@@ -155,43 +155,7 @@ def extract_medical_entities_sync(text: str) -> Tuple[List[MedicalEntity], str]:
     
     global BIOBERT_MODEL, SPACY_MODEL
     
-    # PRIMARY: BioBERT with lower confidence threshold
-    if BIOBERT_MODEL is not None:
-        try:
-            with _biobert_lock:
-                results = BIOBERT_MODEL(text)
-            
-            logger.info(f"BioBERT raw results: {len(results)} entities found")  # Debug
-            
-            for entity in results:
-                # LOWER confidence threshold from 0.6 to 0.4 for better recall
-                if entity.get('score', 0) > 0.4:  # Changed from 0.6
-                    entity_type = map_biobert_label_to_medical(
-                        entity.get('entity_group', ''),
-                        entity.get('word', '')
-                    )
-                    if entity_type != "OTHER":
-                        entities.append(MedicalEntity(
-                            entity=entity_type,
-                            text=entity.get('word', ''),
-                            start=entity.get('start', 0),
-                            end=entity.get('end', 0),
-                            confidence=float(entity.get('score', 0.7))
-                        ))
-                        logger.info(f"BioBERT found: {entity_type} - {entity.get('word', '')}")  # Debug
-            
-            if entities:
-                entities = deduplicate_entities(entities)
-                model_used = "biobert-medical"
-                logger.info(f"BioBERT extracted {len(entities)} entities")
-                return entities, model_used
-            else:
-                logger.info("BioBERT found 0 entities above threshold")
-                
-        except Exception as e:
-            logger.warning(f"BioBERT extraction failed: {e}")
-    
-    # SECONDARY: spaCy with enhanced patterns
+    # PRIMARY: spaCy with enhanced patterns (SWITCHED TO PRIMARY)
     if SPACY_MODEL is not None:
         try:
             with _spacy_lock:
@@ -217,12 +181,54 @@ def extract_medical_entities_sync(text: str) -> Tuple[List[MedicalEntity], str]:
                 entities = deduplicate_entities(entities)
                 model_used = "spacy-medical"
                 logger.info(f"spaCy extracted {len(entities)} entities")
-                return entities, model_used
+                # DON'T return yet - continue to BioBERT for additional entities
                 
         except Exception as e:
             logger.warning(f"spaCy extraction failed: {e}")
     
-    # FALLBACK: Enhanced keyword extraction
+    # SECONDARY: BioBERT with lower confidence threshold (DEMOTED TO SECONDARY)
+    if BIOBERT_MODEL is not None:
+        try:
+            with _biobert_lock:
+                results = BIOBERT_MODEL(text)
+            
+            logger.info(f"BioBERT raw results: {len(results)} entities found")
+            
+            biobert_entities = []
+            for entity in results:
+                # LOWER confidence threshold from 0.6 to 0.4 for better recall
+                if entity.get('score', 0) > 0.4:
+                    entity_type = map_biobert_label_to_medical(
+                        entity.get('entity_group', ''),
+                        entity.get('word', '')
+                    )
+                    if entity_type != "OTHER":
+                        biobert_entities.append(MedicalEntity(
+                            entity=entity_type,
+                            text=entity.get('word', ''),
+                            start=entity.get('start', 0),
+                            end=entity.get('end', 0),
+                            confidence=float(entity.get('score', 0.7))
+                        ))
+                        logger.info(f"BioBERT found: {entity_type} - {entity.get('word', '')}")
+            
+            # Add BioBERT entities to the main list (don't replace)
+            entities.extend(biobert_entities)
+            
+            if biobert_entities:
+                logger.info(f"BioBERT added {len(biobert_entities)} additional entities")
+                model_used = "spacy-medical+biobert"  # Updated model used
+                
+        except Exception as e:
+            logger.warning(f"BioBERT extraction failed: {e}")
+    
+    # If we have entities from either model, return them
+    if entities:
+        entities = deduplicate_entities(entities)
+        logger.info(f"Final ensemble extracted {len(entities)} entities")
+        return entities, model_used
+    
+    # FALLBACK: Enhanced keyword extraction (only if both models failed)
     entities = extract_entities_keywords(text)
     entities = filter_negated_entities(text, entities)
     model_used = "keyword-fallback"

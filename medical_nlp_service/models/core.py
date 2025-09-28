@@ -10,10 +10,7 @@ import torch
 from transformers import (
     pipeline, 
     AutoModelForCausalLM, 
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    WhisperForConditionalGeneration,
-    WhisperProcessor
+    AutoTokenizer, 
 )
 
 # Configure logging
