@@ -11,7 +11,9 @@ from transformers import (
     pipeline, 
     AutoModelForCausalLM, 
     AutoTokenizer,
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
+    WhisperForConditionalGeneration,
+    WhisperProcessor
 )
 
 # Configure logging
@@ -23,6 +25,7 @@ class ModelManager:
     def __init__(self):
         self.SENTENCE_MODEL = None
         self.WHISPER_MODEL = None
+        self.WHISPER_PROCESSOR = None
         self.CLINICALBERT_MODEL = None  # Renamed from BIOBERT_MODEL
         self.SPACY_MODEL = None
         self.MEDICAL_LLM = None
@@ -80,25 +83,26 @@ class ModelManager:
     def _load_sentence_transformer(self):
         """Load SentenceTransformer model"""
         try:
-            from sentence_transformers import SentenceTransformer
-            model = SentenceTransformer('all-MiniLM-L6-v2')
-            logger.info("✓ SentenceTransformer loaded successfully")
-            return model
+            # from sentence_transformers import SentenceTransformer
+            # model = SentenceTransformer('all-MiniLM-L6-v2')
+            # logger.info("✓ SentenceTransformer loaded successfully")
+            # return model
+            logger.info("SentenceTransformer disabled - model not loaded")
         except Exception as e:
             logger.warning(f"SentenceTransformer failed: {e}")
             return None
     
     def _load_whisper(self):
-        """Load Whisper model"""
+        """Load Whisper model using the working approach"""
         try:
             import whisper
-            logger.info(f"Attempting to load Whisper model: {self.WHISPER_MODEL_SIZE}")
+            # Use the exact same approach as your working code
             model = whisper.load_model(self.WHISPER_MODEL_SIZE)
-            model = model.to('cpu')
+            model = model.to('cpu')  # Explicitly move to CPU
             logger.info("✓ Whisper model loaded successfully")
-            return model
+            return {"model": model, "processor": None}
         except Exception as e:
-            logger.error(f"Whisper failed to load: {e}", exc_info=True)
+            logger.error(f"Whisper failed: {e}")
             return None
     
     def _load_clinicalbert(self):
@@ -275,7 +279,10 @@ class ModelManager:
             
             # Only add LLM task if explicitly enabled
             if self.USE_LLM:
-                tasks.append(self.LLM_POOL.submit(self._load_medical_llm))
+                # Convert async function to sync for thread pool
+                tasks.append(self.LLM_POOL.submit(
+                    lambda: asyncio.run(self._load_medical_llm())
+                ))
             else:
                 # Add a placeholder for consistent indexing
                 tasks.append(lambda: (None, None))
@@ -287,7 +294,16 @@ class ModelManager:
             
             # Assign results
             self.SENTENCE_MODEL = completed_tasks[0]
-            self.WHISPER_MODEL = completed_tasks[1]
+            
+            # Handle Whisper result (now returns dict with model and processor)
+            whisper_result = completed_tasks[1]
+            if whisper_result and isinstance(whisper_result, dict):
+                self.WHISPER_MODEL = whisper_result.get("model")
+                self.WHISPER_PROCESSOR = whisper_result.get("processor")
+            else:
+                self.WHISPER_MODEL = None
+                self.WHISPER_PROCESSOR = None
+            
             self.CLINICALBERT_MODEL = completed_tasks[2]  # ClinicalBERT
             self.SPACY_MODEL = completed_tasks[3]
             self.PYANNOTE_PIPELINE = completed_tasks[4]
@@ -358,3 +374,11 @@ def is_llm_enabled():
 def get_clinicalbert_model():
     """Get ClinicalBERT model instance"""
     return model_manager.CLINICALBERT_MODEL
+
+def get_whisper_model():
+    """Get Whisper model instance"""
+    return model_manager.WHISPER_MODEL
+
+def get_whisper_processor():
+    """Get Whisper processor instance"""
+    return model_manager.WHISPER_PROCESSOR

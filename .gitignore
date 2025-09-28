@@ -5,3 +5,7 @@
 *.flac
 *.aac
 *.m4a
+
+# Libs
+*.deb
+*.pyc
