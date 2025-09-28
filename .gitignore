@@ -9,3 +9,7 @@
 # Libs
 *.deb
 *.pyc
+
+# Text files
+scripts/audio_data.txt
+detail.txt

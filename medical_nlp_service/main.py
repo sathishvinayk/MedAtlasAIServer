@@ -1,47 +1,10 @@
-"""
-Purpose: Perform the machine learning magic.
-
-Service: asr-service (Automatic Speech Recognition)
-API: POST /transcribe
-Input: Audio file or stream.
-Output: Raw transcript with speaker diarization.
-Technology: A fine-tuned OpenAI Whisper model or a custom model running on NVIDIA Riva, hosted on a GPU-enabled cloud instance.
-
-Service: clinical-nlu-service (Natural Language Understanding)
-API: POST /analyze
-Input: Raw transcript.
-Output: Structured JSON of extracted medical entities (symptoms, medications, diagnoses) and their relationships.
-Technology: Python (PyTorch/TensorFlow), using a fine-tuned BioBERT or ClinicalBERT model from Hugging Face.
-
-Service: note-assembly-service
-API: POST /generate-note
-Input: Structured medical entities + original transcript.
-Output: A fully formatted clinical note (e.g., in SOAP format).
-Technology: Could be a rules-based templating engine or a specialized LLM (like Llama 3 or a fine-tuned GPT) prompted specifically for this task.
-"""
-# Components together for a basic prototype:
-# User records audio in your web app.
-# backend sends the audio file to a self-hosted Whisper model.
-# This model could be running on a cloud server with a GPU (e.g., an AWS g4dn.xlarge instance).
-# Whisper returns the raw transcript.
-# backend takes the transcript and sends it to your medical NER model (e.g., a BioBERT model from Hugging Face).
-# This model extracts structured data: [[{"entity": "SYMPTOM", "word": "headache"}], ...]
-# You then take this structured data and either:
-# a) Use a rule-based system to template it into a note: "Patient complains of [SYMPTOM]."
-# b) Send it to a smaller, self-hosted LLM (like a fine-tuned Mistral 7B) with a prompt: "Convert these medical entities into a clinical assessment paragraph: [ENTITIES]"
-# The final note is presented to the user.
-# ASR -> NLU -> SOAP
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
-import numpy as np
+from pydantic import validator
 import logging
-from typing import List, Optional, Dict, Any, Tuple
-import hashlib
+from typing import List, Tuple
 import base64
 from pyannote.audio import Pipeline
-import torchaudio
-import tempfile
 import os
 import re
 import asyncio
@@ -54,15 +17,13 @@ import torch
 from transformers import (
     AutoTokenizer, 
     AutoModelForCausalLM, 
-    GenerationConfig,
-    BitsAndBytesConfig
 )
 from utils import normalize_medication_name, truncate_text, get_audio_duration, map_spacy_label_to_medical, universal_embedding, universal_transcript, temp_audio_file, map_biobert_label_to_medical, align_transcription_with_speakers
 from soap_generator import generate_soap_note_rule_based
 from entities import MedicalEntity, SpeakerSegment, EmbedRequest, EmbedResponse, ProcessAudioRequest, ProcessAudioResponse
 from entity_extractor import extract_entities_keywords, deduplicate_entities, filter_negated_entities
-from constants import MEDICAL_KEYWORDS, MEDICATION_SYNONYMS
-from config import MAX_AUDIO_BYTES, WHISPER_MODEL_SIZE, MEDICAL_LLM_NAME, PYANNOTE_AUTH_TOKEN
+from constants import MEDICAL_KEYWORDS
+from config import WHISPER_MODEL_SIZE, MEDICAL_LLM_NAME, PYANNOTE_AUTH_TOKEN
 
 # from huggingface_hub import hf_hub_download
 # hf_hub_download(repo_id="emilyalsentzer/Bio_ClinicalBERT", filename="pytorch_model.bin", force_download=True)
