@@ -3,11 +3,16 @@ package main
 import (
 	"MedAtlasAIServer/internal/embeddingClient"
 	"MedAtlasAIServer/internal/models"
+	"encoding/base64"
 	"encoding/json"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
+	"time"
+
+	pb "MedAtlasAIServer/gen"
 
 	"github.com/gorilla/mux"
 	"github.com/qdrant/go-client/qdrant"
@@ -31,8 +36,76 @@ type SearchResponse struct {
 }
 
 type Server struct {
-	QdrantClient qdrant.PointsClient
-	Embedder     *embeddingClient.Client
+	QdrantClient  qdrant.PointsClient
+	Embedder      *embeddingClient.Client
+	Sessions      map[string]*models.StreamingSession
+	SessionsMutex sync.RWMutex
+	Streams       map[string]pb.AudioProcessor_ProcessAudioStreamClient
+	StreamsMutex  sync.RWMutex
+}
+
+func main() {
+	embeddedHost := os.Getenv("EMBEDDING_SERVICE_HOST")
+	if embeddedHost == "" { //Keep localhost for now
+		embeddedHost = "http://localhost:8000"
+	}
+	embedder := embeddingClient.NewClient(embeddedHost)
+	qdrantHost := os.Getenv("QDRANT_HOST")
+	if qdrantHost == "" { //Keep localhost for now
+		qdrantHost = "localhost:6334"
+	}
+
+	conn, err := grpc.Dial(qdrantHost, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("Could not connect to Qdrant: %v", err)
+	}
+	defer conn.Close()
+	qdrantClient := qdrant.NewPointsClient(conn)
+
+	server := &Server{
+		QdrantClient: qdrantClient,
+		Embedder:     embedder,
+		Sessions:     make(map[string]*models.StreamingSession),
+		Streams:      make(map[string]pb.AudioProcessor_ProcessAudioStreamClient),
+	}
+
+	// Routing
+	r := mux.NewRouter()
+	r.HandleFunc("/search", server.searchHandler).Methods("POST")
+	r.HandleFunc("/health", server.healthHandler).Methods("GET")
+	r.HandleFunc("/ready", server.readyHandler).Methods("GET")
+
+	r.HandleFunc("/process-audio", server.processAudioHandler).Methods("POST", "OPTIONS")
+
+	r.HandleFunc("/stream/start", server.startStreamingHandler).Methods("POST")
+	r.HandleFunc("/stream/chunk", server.processStreamingChunkHandler).Methods("POST")
+	r.HandleFunc("/ws/stream", server.websocketStreamHandler).Methods("GET")
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	// Cors
+	corsMiddleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+			if r.Method == "OPTIONS" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+	log.Printf("Server starting on port %s", port)
+	log.Fatal(http.ListenAndServe(":"+port, corsMiddleware(r)))
+}
+
+func generateSessionID() string {
+	return strconv.FormatInt(time.Now().UnixNano(), 36)
 }
 
 func formatPointID(pointID *qdrant.PointId) string {
@@ -48,6 +121,177 @@ func formatPointID(pointID *qdrant.PointId) string {
 	default:
 		return ""
 	}
+}
+
+func (s *Server) startStreamingHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	sessionID := generateSessionID()
+
+	ctx := r.Context()
+	stream, err := s.Embedder.CreateStream(ctx, sessionID, 16000)
+	if err != nil {
+		http.Error(w, `{"error": "Failed to create stream"}`, http.StatusInternalServerError)
+		return
+	}
+
+	s.SessionsMutex.Lock()
+	s.Sessions[sessionID] = &models.StreamingSession{
+		SessionID: sessionID,
+		Status:    "active",
+		CreatedAt: time.Now().Unix(),
+	}
+	s.SessionsMutex.Unlock()
+
+	s.StreamsMutex.Lock()
+	s.Streams[sessionID] = stream
+	s.StreamsMutex.Unlock()
+
+	log.Printf("Started streaming session: %s", sessionID)
+
+	json.NewEncoder(w).Encode(map[string]string{
+		"session_id": sessionID,
+		"status":     "active",
+		"message":    "Streaming session started",
+	})
+}
+
+func (s *Server) processStreamingChunkHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("🚀 Received streaming chunk request")
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	var req models.StreamingAudioRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("❌ JSON decode error: %v", err)
+		http.Error(w, `{"error": "Invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+
+	s.SessionsMutex.RLock()
+	session, exists := s.Sessions[req.SessionID]
+	s.SessionsMutex.RUnlock()
+
+	if !exists || session.Status != "active" {
+		http.Error(w, `{"error": "Invalid or inactive session"}`, http.StatusBadRequest)
+		return
+	}
+
+	audioData, err := base64.StdEncoding.DecodeString(req.AudioChunk)
+	if err != nil {
+		log.Printf("❌ Audio decode error: %v", err)
+		http.Error(w, `{"error": "Invalid audio data"}`, http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Processing chunk %d, size: %d bytes, final: %t", req.ChunkIndex, len(audioData), req.IsFinal)
+
+	// Store the chunk in the session
+	s.SessionsMutex.Lock()
+	session.AudioChunks = append(session.AudioChunks, audioData)
+	s.SessionsMutex.Unlock()
+
+	// For non-final chunks, return immediately with empty results
+	if !req.IsFinal {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"session_id":  req.SessionID,
+			"status":      "buffered",
+			"chunk_index": req.ChunkIndex,
+			"is_final":    req.IsFinal,
+			"results":     []models.StreamingResult{},
+		})
+		log.Printf("Buffered chunk %d, waiting for final chunk", req.ChunkIndex)
+		return
+	}
+
+	// For final chunk, process all buffered audio
+	log.Printf("Final chunk received, processing all buffered audio")
+
+	s.SessionsMutex.RLock()
+	allChunks := make([][]byte, len(session.AudioChunks))
+	copy(allChunks, session.AudioChunks)
+	s.SessionsMutex.RUnlock()
+
+	// Create channel and send all chunks
+	audioChunks := make(chan []byte, len(allChunks)+1)
+	for _, chunk := range allChunks {
+		audioChunks <- chunk
+	}
+	close(audioChunks) // This will trigger the final signal in the client
+
+	ctx := r.Context()
+	resultChan, err := s.Embedder.ProcessAudioStream(ctx, req.SessionID, audioChunks, 16000)
+	if err != nil {
+		log.Printf("❌ gRPC streaming error: %v", err)
+		http.Error(w, `{"error": "Streaming unavailable"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	var results []models.StreamingResult
+	timeout := time.After(60 * time.Second) // 60-second timeout for processing
+
+	for {
+		select {
+		case result, ok := <-resultChan:
+			if !ok {
+				log.Printf("Result channel closed")
+				goto SendResponse
+			}
+			if result != nil {
+				results = append(results, *result)
+				log.Printf("Received result type: %s", result.Type)
+
+				// Update session transcript
+				s.SessionsMutex.Lock()
+				if session, exists := s.Sessions[req.SessionID]; exists {
+					if result.Type == "transcript" {
+						if text, ok := result.Data["text"].(string); ok {
+							session.CurrentTranscript += " " + text
+							log.Printf("Updated transcript: %s", text)
+						}
+					}
+				}
+				s.SessionsMutex.Unlock()
+			}
+
+		case <-timeout:
+			log.Printf("Timeout waiting for results")
+			goto SendResponse
+
+		case <-ctx.Done():
+			log.Printf("Request context cancelled")
+			goto SendResponse
+		}
+	}
+
+SendResponse:
+	// Clear the buffer and mark session as completed
+	s.SessionsMutex.Lock()
+	if session, exists := s.Sessions[req.SessionID]; exists {
+		session.AudioChunks = nil // Clear buffer
+		session.Status = "completed"
+		log.Printf("Session %s completed with %d results", req.SessionID, len(results))
+	}
+	s.SessionsMutex.Unlock()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"session_id":  req.SessionID,
+		"status":      "processed",
+		"chunk_index": req.ChunkIndex,
+		"is_final":    req.IsFinal,
+		"results":     results,
+	})
+
+	log.Printf("Sent response for final chunk with %d results", len(results))
+}
+
+func (s *Server) websocketStreamHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotImplemented)
+	json.NewEncoder(w).Encode(map[string]string{
+		"error": "WebSocket streaming not implemented yet",
+	})
 }
 
 func safeGetString(payload map[string]*qdrant.Value, key string) string {
@@ -149,6 +393,7 @@ func (s *Server) readyHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) processAudioHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	var audioReq models.ProcessAudioRequest
 	if err := json.NewDecoder(r.Body).Decode(&audioReq); err != nil {
@@ -165,58 +410,4 @@ func (s *Server) processAudioHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(aiResult)
-}
-
-func main() {
-	embeddedHost := os.Getenv("EMBEDDING_SERVICE_HOST")
-	if embeddedHost == "" { //Keep localhost for now
-		embeddedHost = "http://localhost:8000"
-	}
-	embedder := embeddingClient.NewClient(embeddedHost)
-	qdrantHost := os.Getenv("QDRANT_HOST")
-	if qdrantHost == "" { //Keep localhost for now
-		qdrantHost = "localhost:6334"
-	}
-
-	conn, err := grpc.Dial(qdrantHost, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Fatalf("Could not connect to Qdrant: %v", err)
-	}
-	defer conn.Close()
-	qdrantClient := qdrant.NewPointsClient(conn)
-
-	server := &Server{
-		QdrantClient: qdrantClient,
-		Embedder:     embedder,
-	}
-
-	// Routing
-	r := mux.NewRouter()
-	r.HandleFunc("/search", server.searchHandler).Methods("POST")
-	r.HandleFunc("/health", server.healthHandler).Methods("GET")
-	r.HandleFunc("/ready", server.readyHandler).Methods("GET")
-
-	r.HandleFunc("/process-audio", server.processAudioHandler).Methods("POST", "OPTIONS")
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-
-	// Cors
-	corsMiddleware := func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-			if r.Method == "OPTIONS" {
-				w.WriteHeader(http.StatusOK)
-				return
-			}
-			next.ServeHTTP(w, r)
-		})
-	}
-	log.Printf("Server starting on port %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, corsMiddleware(r)))
 }

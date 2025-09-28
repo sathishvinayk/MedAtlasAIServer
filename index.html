@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Medical Audio Streaming Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        button { padding: 10px 20px; margin: 5px; font-size: 16px; }
+        .status { padding: 10px; margin: 10px 0; border-radius: 5px; }
+        .success { background: #d4edda; color: #155724; }
+        .error { background: #f8d7da; color: #721c24; }
+        .info { background: #d1ecf1; color: #0c5460; }
+        #results { margin-top: 20px; padding: 10px; border: 1px solid #ccc; height: 300px; overflow-y: auto; }
+        .result-item { margin: 5px 0; padding: 5px; border-left: 3px solid #007bff; }
+    </style>
+</head>
+<body>
+    <h1>Medical Audio Streaming Test Client</h1>
+    
+    <div>
+        <button onclick="startStreaming()">Start Streaming Session</button>
+        <button onclick="startRecording()">Start Recording</button>
+        <button onclick="stopRecording()">Stop Recording</button>
+        <button onclick="testBatchProcessing()">Test Batch Processing</button>
+    </div>
+
+    <div id="status"></div>
+    
+    <div>
+        <h3>Real-time Results:</h3>
+        <div id="results"></div>
+    </div>
+
+    <script>
+        let sessionId = null;
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let chunkIndex = 0;
+        let isRecording = false;
+
+        function updateStatus(message, type = 'info') {
+            const statusDiv = document.getElementById('status');
+            statusDiv.innerHTML = `<div class="status ${type}">${new Date().toLocaleTimeString()}: ${message}</div>`;
+        }
+
+        function addResult(type, data) {
+            const resultsDiv = document.getElementById('results');
+            const resultItem = document.createElement('div');
+            resultItem.className = 'result-item';
+            resultItem.innerHTML = `<strong>${type}:</strong> ${JSON.stringify(data)}`;
+            resultsDiv.appendChild(resultItem);
+            resultsDiv.scrollTop = resultsDiv.scrollHeight;
+        }
+
+        // Start a new streaming session
+        async function startStreaming() {
+            try {
+                updateStatus('Starting streaming session...');
+                
+                const response = await fetch('http://localhost:8080/stream/start', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const data = await response.json();
+                sessionId = data.session_id;
+                
+                updateStatus(`Streaming session started: ${sessionId}`, 'success');
+                addResult('session', data);
+                
+            } catch (error) {
+                updateStatus(`Error starting session: ${error.message}`, 'error');
+            }
+        }
+
+        // Convert audio blob to base64
+        function blobToBase64(blob) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onloadend = () => {
+                    // Remove data:audio/webm;codecs=opus;base64, prefix
+                    const base64 = reader.result.split(',')[1];
+                    resolve(base64);
+                };
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+            });
+        }
+
+        // Send audio chunk to server
+        async function sendAudioChunk(audioBlob, isFinal = false) {
+            if (!sessionId) {
+                updateStatus('No active session. Please start streaming first.', 'error');
+                return;
+            }
+
+            try {
+                const base64Audio = await blobToBase64(audioBlob);
+                
+                const response = await fetch('http://localhost:8080/stream/chunk', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        session_id: sessionId,
+                        audio_chunk: base64Audio,
+                        chunk_index: chunkIndex,
+                        is_final: isFinal
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const result = await response.json();
+                addResult('chunk', result);
+                
+                // Display real-time results
+                if (result.results) {
+                    result.results.forEach(streamResult => {
+                        addResult(streamResult.type, streamResult.data);
+                    });
+                }
+                
+                chunkIndex++;
+                
+            } catch (error) {
+                updateStatus(`Error sending chunk: ${error.message}`, 'error');
+            }
+        }
+
+        // Start audio recording
+        async function startRecording() {
+            if (!sessionId) {
+                updateStatus('Please start a streaming session first', 'error');
+                return;
+            }
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true
+                    } 
+                });
+                
+                mediaRecorder = new MediaRecorder(stream, {
+                    mimeType: 'audio/webm;codecs=opus',
+                    audioBitsPerSecond: 16000
+                });
+                
+                mediaRecorder.ondataavailable = async (event) => {
+                    if (event.data.size > 0) {
+                        audioChunks.push(event.data);
+                        await sendAudioChunk(event.data, false);
+                    }
+                };
+                
+                mediaRecorder.onstop = async () => {
+                    // Send final chunk
+                    if (audioChunks.length > 0) {
+                        const finalBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                        await sendAudioChunk(finalBlob, true);
+                    }
+                    
+                    // Stop all tracks
+                    stream.getTracks().forEach(track => track.stop());
+                    audioChunks = [];
+                    isRecording = false;
+                    updateStatus('Recording stopped', 'success');
+                };
+                
+                mediaRecorder.start(1000); // Collect 1-second chunks
+                isRecording = true;
+                updateStatus('Recording started... Speak into your microphone', 'success');
+                
+            } catch (error) {
+                updateStatus(`Error starting recording: ${error.message}`, 'error');
+            }
+        }
+
+        // Stop recording
+        function stopRecording() {
+            if (mediaRecorder && isRecording) {
+                console.log('🛑 Stopping recording...');
+                mediaRecorder.stop();
+                isRecording = false;
+                updateStatus('Recording stopped', 'success');
+            } else {
+                console.log('⚠️ No active recording to stop');
+                updateStatus('No active recording to stop', 'error');
+            }
+        }
+
+        // Test batch processing (existing endpoint)
+        async function testBatchProcessing() {
+            try {
+                updateStatus('Testing batch processing...');
+                
+                // Create a simple test audio (you would replace this with real audio data)
+                const testAudioData = "test"; // This should be real base64 audio data
+                
+                const response = await fetch('http://localhost:8080/process-audio', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        audio_data: testAudioData,
+                        file_name: 'test_audio.wav'
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const result = await response.json();
+                addResult('batch', result);
+                updateStatus('Batch processing test completed', 'success');
+                
+            } catch (error) {
+                updateStatus(`Batch processing error: ${error.message}`, 'error');
+            }
+        }
+
+        // Auto-start session when page loads
+        window.addEventListener('load', () => {
+            updateStatus('Client loaded. Click "Start Streaming Session" to begin.');
+        });
+    </script>
+</body>
+</html>

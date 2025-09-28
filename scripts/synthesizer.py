@@ -36,7 +36,7 @@ voice_profiles = {
     "Patient": {"tld": "co.uk", "slow": True}  # British English - slightly slower, more deliberate
 }
 
-final_output_file = "doctor_patient_conversation.mp3"
+final_output_file = "doctor_patient_conversation.wav"
 
 # --- Function to generate TTS audio for a line ---
 def generate_audio_for_line(text, filename, **kwargs):
@@ -49,21 +49,36 @@ def generate_audio_for_line(text, filename, **kwargs):
         print(f"✗ Failed to generate {filename}: {e}")
         return False
 
-# --- Function to add pause between lines ---
-def add_pause_between_lines(input_file, output_file, pause_duration=1.0):
-    """Add silence between lines for more natural conversation flow"""
+# --- Function to convert MP3 to proper WAV ---
+def convert_to_wav(input_file, output_file):
+    """Convert MP3 to proper WAV format with correct encoding"""
     try:
         cmd = [
             'ffmpeg',
             '-i', input_file,
-            '-af', f'apad=pad_dur={pause_duration}',
+            '-acodec', 'pcm_s16le',  # Proper WAV codec
+            '-ar', '16000',          # 16kHz sample rate
+            '-ac', '1',              # Mono
+            '-f', 'wav',             # Force WAV format
             output_file,
             '-y'
         ]
-        subprocess.run(cmd, capture_output=True, check=True)
-        return True
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        
+        # Verify the conversion worked
+        if os.path.exists(output_file) and os.path.getsize(output_file) > 1000:
+            print(f"✓ Converted to WAV: {output_file}")
+            return True
+        else:
+            print(f"✗ Conversion failed: {output_file} is too small")
+            return False
+            
+    except subprocess.CalledProcessError as e:
+        print(f"✗ FFmpeg conversion failed: {e}")
+        print(f"Stderr: {e.stderr}")
+        return False
     except Exception as e:
-        print(f"Failed to add pause: {e}")
+        print(f"✗ Conversion error: {e}")
         return False
 
 # --- Main Execution ---
@@ -71,7 +86,7 @@ print("Creating synthetic doctor-patient conversation...")
 print(f"Total lines: {len(script)}")
 print("-" * 50)
 
-# Create a list to hold all the audio file names
+# Create a list to hold all the WAV file names
 audio_files = []
 temp_dir = "temp_lines"
 os.makedirs(temp_dir, exist_ok=True)
@@ -81,20 +96,22 @@ successful_generations = 0
 for i, (speaker, line_text) in enumerate(script):
     print(f"[{i+1:02d}/{len(script):02d}] {speaker}: {line_text[:50]}...")
     
-    temp_filename = f"{temp_dir}/line_{i:02d}.mp3"
-    temp_with_pause = f"{temp_dir}/line_{i:02d}_paused.mp3"
+    # Generate as MP3 first (gTTS limitation), then convert to proper WAV
+    temp_mp3 = f"{temp_dir}/line_{i:02d}.mp3"
+    temp_wav = f"{temp_dir}/line_{i:02d}.wav"
     
-    if generate_audio_for_line(line_text, temp_filename, **voice_profiles[speaker]):
-        # Add pause after each line
-        if add_pause_between_lines(temp_filename, temp_with_pause, pause_duration=1.5):
-            audio_files.append(temp_with_pause)
+    if generate_audio_for_line(line_text, temp_mp3, **voice_profiles[speaker]):
+        # Convert MP3 to proper WAV format
+        if convert_to_wav(temp_mp3, temp_wav):
+            audio_files.append(temp_wav)
             successful_generations += 1
+            # Remove the temporary MP3 file
+            os.remove(temp_mp3)
         else:
-            audio_files.append(temp_filename)  # Fallback to original
-            successful_generations += 1
+            print(f"✗ Failed to convert line {i} to WAV")
     
     # Add small delay to avoid rate limiting
-    time.sleep(0.5)
+    time.sleep(1)
 
 print(f"\nSuccessfully generated {successful_generations}/{len(script)} lines")
 
@@ -102,69 +119,54 @@ if successful_generations == 0:
     print("No audio files were generated. Exiting.")
     exit(1)
 
-# 2. Create a text file listing all audio files for ffmpeg
-concat_list_file = f"{temp_dir}/concat_list.txt"
-with open(concat_list_file, 'w') as f:
-    for audio_file in audio_files:
-        f.write(f"file '{os.path.abspath(audio_file)}'\n")
-
-# 3. Use ffmpeg to concatenate all files with proper audio normalization
+# 2. Concatenate all WAV files
 try:
-    print("\nCombining audio files with ffmpeg...")
+    print("\nCombining WAV files...")
     
-    # Use filter complex for better audio quality and normalization
-    input_files = "".join([f"-i {file} " for file in audio_files])
-    filter_complex = f"concat=n={len(audio_files)}:v=0:a=1 [a]"
+    # Create file list for concatenation
+    concat_list_file = f"{temp_dir}/file_list.txt"
+    with open(concat_list_file, 'w') as f:
+        for audio_file in audio_files:
+            f.write(f"file '{os.path.abspath(audio_file)}'\n")
     
-    cmd = f'ffmpeg {input_files} -filter_complex "{filter_complex}" -map "[a]" -af "loudnorm=I=-16:TP=-1.5:LRA=11" -c:a libmp3lame -q:a 2 {final_output_file} -y'
+    # Concatenate using ffmpeg
+    cmd = [
+        'ffmpeg',
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', concat_list_file,
+        '-c', 'copy',  # Copy without re-encoding
+        final_output_file,
+        '-y'
+    ]
     
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    
-    if result.returncode != 0:
-        print(f"Error with filter complex: {result.stderr}")
-        # Fallback to simple concat
-        print("Trying simple concat method...")
-        cmd = [
-            'ffmpeg', 
-            '-f', 'concat', 
-            '-safe', '0', 
-            '-i', concat_list_file,
-            '-c', 'copy',
-            final_output_file,
-            '-y'
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise Exception(f"FFmpeg failed: {result.stderr}")
-    
-    # Get final file duration
-    duration_cmd = ['ffmpeg', '-i', final_output_file, '2>&1']
-    duration_result = subprocess.run(duration_cmd, capture_output=True, text=True)
-    
-    print(f"✅ Success! Audio file created: {final_output_file}")
-    print(f"📊 Conversation duration: Approximately {len(script) * 3} seconds")
-    
-except FileNotFoundError:
-    print("❌ Error: ffmpeg not found. Please install ffmpeg:")
-    print("macOS: brew install ffmpeg")
-    print("Windows: Download from https://ffmpeg.org/download.html")
-    print("Linux: sudo apt install ffmpeg")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print(f"✅ Success! Final WAV file created: {final_output_file}")
+        
+        # Verify final file
+        final_size = os.path.getsize(final_output_file)
+        print(f"📊 Final file size: {final_size} bytes")
+        
+        # Test base64 encoding
+        base64_test = subprocess.run(['base64', '-w', '0', final_output_file], capture_output=True, text=True)
+        if len(base64_test.stdout) > 100:
+            print(f"✓ Base64 encoding test passed: {len(base64_test.stdout)} characters")
+        else:
+            print("✗ Base64 encoding test failed - string too short")
+            
+    else:
+        print(f"❌ Concatenation failed: {result.stderr}")
 
 except Exception as e:
     print(f"❌ An error occurred: {e}")
 
 finally:
-    # 4. Cleanup temporary files
+    # Cleanup temporary files
     print("\n🧹 Cleaning up temporary files...")
     for file in audio_files:
         try:
             os.remove(file)
-        except:
-            pass
-    # Remove original files without pauses
-    for i in range(len(script)):
-        try:
-            os.remove(f"{temp_dir}/line_{i:02d}.mp3")
         except:
             pass
     try:
@@ -173,5 +175,4 @@ finally:
     except:
         pass
 
-print("🎉 Process completed successfully!")
-print(f"🎧 Your conversation is ready: {final_output_file}")
+print("🎉 Process completed!")
