@@ -1,9 +1,9 @@
 # main.py
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException  # Add WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import validator
 import logging
-from typing import Any, List, Tuple, AsyncGenerator, Dict, Optional  # Add these
+from typing import Any, List, Tuple, AsyncGenerator, Dict
 import base64
 from pyannote.audio import Pipeline
 import os
@@ -17,16 +17,18 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 import base64 
 import time    
+import struct
 from transformers import (
     AutoTokenizer, 
     AutoModelForCausalLM, 
 )
 import tempfile  # Make sure this is imported
 import os
+from dataclasses import dataclass, field
 from utils import normalize_medication_name, truncate_text, get_audio_duration, map_spacy_label_to_medical, universal_transcript, temp_audio_file, map_biobert_label_to_medical, align_transcription_with_speakers
 from soap_generator import generate_soap_note_rule_based
 from audio_models import ProcessAudioRequest, ProcessAudioResponse
-from shared_models import MedicalEntity, SpeakerSegment, EndStreamResponse, EndStreamRequest, StartStreamingRequest, StartStreamResponse, StreamAudioRequest, StreamAudioResponse
+from shared_models import MedicalEntity, SpeakerSegment
 from entity_extractor import extract_entities_keywords, deduplicate_entities, filter_negated_entities, extract_medication_changes, extract_medical_patterns
 from constants import MEDICAL_KEYWORDS
 from config import WHISPER_MODEL_SIZE, MEDICAL_LLM_NAME, PYANNOTE_AUTH_TOKEN
@@ -69,7 +71,6 @@ logging.basicConfig(
 logger = logging.getLogger("medical-nlp-service")
 
 # Global models (loaded asynchronously)
-SENTENCE_MODEL = None
 WHISPER_MODEL = None
 BIOBERT_MODEL = None
 SPACY_MODEL = None
@@ -87,7 +88,6 @@ MAX_WORKERS_GENERAL = int(os.getenv('MAX_WORKERS_GENERAL', '4'))
 MAX_WORKERS_LLM = int(os.getenv('MAX_WORKERS_LLM', '1'))  # LLM is memory-intensive
 MAX_WORKERS_PYANNOTE = int(os.getenv('MAX_WORKERS_PYANNOTE', '1'))
 
-SENTENCE_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_SENTENCE, thread_name_prefix="sentence_")
 WHISPER_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_WHISPER, thread_name_prefix="whisper_")
 BIOBERT_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_BIOBERT, thread_name_prefix="biobert_")
 SPACY_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_SPACY, thread_name_prefix="spacy_")
@@ -102,10 +102,6 @@ _llm_lock = Lock()
 _pyannote_lock = Lock()  # Add pyannote lock
 _model_load_lock = Lock()
 _models_loaded = False
-
-import struct
-import wave
-import io
 
 class AudioStreamProcessor:
     """Process audio streams in real-time without temp files"""
@@ -183,7 +179,6 @@ def perform_diarization(audio_path: str) -> List[SpeakerSegment]:
     except Exception as e:
         logger.error(f"Pyannote diarization failed: {e}")
         return []
-
 
 # Load spaCy with EntityRuler (unchanged)
 def load_spacy_with_ruler():
@@ -390,7 +385,7 @@ def generate_soap_note_llm(transcript: str, entities: List[MedicalEntity]) -> st
 # Model loading functions (updated to include medical LLM)
 async def load_models_async():
     """Asynchronously load all models including medical LLM"""
-    global SENTENCE_MODEL, WHISPER_MODEL, PYANNOTE_PIPELINE ,BIOBERT_MODEL, SPACY_MODEL, MEDICAL_LLM, MEDICAL_TOKENIZER, _models_loaded
+    global WHISPER_MODEL, PYANNOTE_PIPELINE ,BIOBERT_MODEL, SPACY_MODEL, MEDICAL_LLM, MEDICAL_TOKENIZER, _models_loaded
     global REALTIME_PROCESSOR  # Add this
 
     with _model_load_lock:
@@ -398,21 +393,6 @@ async def load_models_async():
             return
         
         logger.info("Starting async model loading...")
-        
-        async def load_sentence_transformer():
-            try:
-                # def _load_st():
-                #     from sentence_transformers import SentenceTransformer
-                #     return SentenceTransformer('all-MiniLM-L6-v2')
-                
-                # model = await asyncio.get_event_loop().run_in_executor(
-                #     GENERAL_POOL, _load_st
-                # )
-                logger.info("✓ SentenceTransformer not loaded")
-                # return model
-            except Exception as e:
-                logger.warning(f"SentenceTransformer failed: {e}")
-                return None
         
         async def load_whisper():
             try:
@@ -583,7 +563,6 @@ async def load_models_async():
         
         # Load models concurrently
         results = await asyncio.gather(
-            load_sentence_transformer(),
             load_whisper(),
             load_biobert(),
             load_spacy(),
@@ -606,7 +585,7 @@ async def load_models_async():
             else:
                 sanitized_results.append(result)
         
-        SENTENCE_MODEL, WHISPER_MODEL, BIOBERT_MODEL, SPACY_MODEL, PYANNOTE_PIPELINE, llm_result = sanitized_results
+        WHISPER_MODEL, BIOBERT_MODEL, SPACY_MODEL, PYANNOTE_PIPELINE, llm_result = sanitized_results
 
         # Then handle the LLM result
         if llm_result and isinstance(llm_result, tuple) and len(llm_result) == 2:
@@ -643,7 +622,6 @@ async def cleanup_models():
     PYANNOTE_PIPELINE = None
     
     # Shutdown thread pools
-    SENTENCE_POOL.shutdown(wait=False)
     WHISPER_POOL.shutdown(wait=False)
     BIOBERT_POOL.shutdown(wait=False)
     SPACY_POOL.shutdown(wait=False)
@@ -772,10 +750,6 @@ async def process_audio(request: ProcessAudioRequest):
             request_id=request_id
         )
     
-from dataclasses import dataclass, field
-from typing import AsyncIterator, Dict, List, Optional, Any, Tuple
-import asyncio
-
 @dataclass
 class PatientContext:
     """Patient context maintained throughout the conversation"""
@@ -1023,12 +997,11 @@ class RealTimeMedicalProcessor:
         # Combine all transcripts so far for context
         all_transcripts = " ".join(patient_context.conversation_history + [transcript])
         
-        # Combine all entities - FIXED:
-        all_entities = patient_context.extracted_entities.copy()  # All previous entities
-        all_entities.extend(entities)  # Add new entities
+        # Use ALL stored entities (no need to combine manually)
+        all_entities = patient_context.extracted_entities  # ← SIMPLIFIED
         
         print(f"🔍 DEBUG: {len(patient_context.conversation_history)} transcripts, {len(entities)} new entities")
-        print(f"🔍 DEBUG: Total unique entities: {len(all_entities)}")
+        print(f"🔍 DEBUG: Total stored entities: {len(all_entities)}")
         
         # Use your sophisticated rule-based generator
         current_soap = generate_soap_note_rule_based(all_transcripts, all_entities)
@@ -1036,8 +1009,6 @@ class RealTimeMedicalProcessor:
         print(f"🔍 DEBUG: Generated SOAP length: {len(current_soap)}")
         if current_soap:
             print(f"🔍 DEBUG: SOAP preview: {current_soap[:200]}...")
-        else:
-            print("❌ DEBUG: SOAP generation returned empty!")
         
         # Update patient context with current SOAP state
         patient_context.soap_note_sections = self._parse_soap_to_sections(current_soap)
@@ -1275,7 +1246,6 @@ class RealTimeMedicalProcessor:
             if not wav_data or len(wav_data) < 1000:
                 if is_final:
                     # Even with small audio, send current SOAP state immediately
-                    current_soap
                     final_soap = self._format_current_soap(patient_context.soap_note_sections)
                     yield RealtimeResult(
                         type="soap_note_complete",
@@ -1348,6 +1318,9 @@ class RealTimeMedicalProcessor:
             # Extract entities (fast operation)
             entities = await self._extract_medical_entities_fast(transcript)
             if entities:
+                # STORE ENTITIES CONSISTENTLY
+                patient_context.extracted_entities.extend(entities)  # ← ADD THIS
+                patient_context.extracted_entities = deduplicate_entities(patient_context.extracted_entities)
                 self._update_patient_context(patient_context, entities)
                 
                 yield RealtimeResult(
@@ -1601,169 +1574,7 @@ class RealTimeMedicalProcessor:
             return f"Quick SOAP note generation failed: {str(e)}"
 
 # =============================================================================
-# WEBSOCKET MANAGER FOR REAL-TIME STREAMING
-# =============================================================================
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: Dict[str, WebSocket] = {}
-        self.lock = asyncio.Lock()
-    
-    async def connect(self, websocket: WebSocket, session_id: str):
-        async with self.lock:
-            self.active_connections[session_id] = websocket
-        logger.info(f"WebSocket connected for session: {session_id}")
-    
-    def disconnect(self, session_id: str):
-        if session_id in self.active_connections:
-            del self.active_connections[session_id]
-        logger.info(f"WebSocket disconnected for session: {session_id}")
-    
-    async def send_realtime_result(self, session_id: str, result: RealtimeResult):
-        """Send real-time result with error handling"""
-        async with self.lock:
-            websocket = self.active_connections.get(session_id)
-        
-        if websocket:
-            try:
-                await websocket.send_json({
-                    "type": result.type,
-                    "data": result.data,
-                    "session_id": result.session_id,
-                    "is_partial": result.is_partial,
-                    "timestamp": result.timestamp
-                })
-            except Exception as e:
-                logger.warning(f"WebSocket send error for {session_id}: {e}")
-                self.disconnect(session_id)
-
-# Global connection manager
-connection_manager = ConnectionManager()
-
-@dataclass
-class StreamingSession:
-    """Manage state for each streaming session"""
-    session_id: str
-    chunk_generator: 'AudioChunkGenerator'
-    realtime_processor: Any = None
-    start_time: float = None
-    websocket: Optional[WebSocket] = None
-    latest_results: Dict[str, Any] = None  # Add this to store results
-    
-    def __post_init__(self):
-        if self.start_time is None:
-            self.start_time = time.time()
-        if self.latest_results is None:
-            self.latest_results = {}
-
-# Global session storage
-_streaming_sessions: Dict[str, StreamingSession] = {}
-_session_lock = Lock()
-
-class AudioChunkGenerator:
-    """Generator to convert HTTP chunks to async iterator"""
-    def __init__(self):
-        self.chunks = asyncio.Queue()
-        self.final_chunk_sent = False
-    
-    async def put_chunk(self, chunk: bytes, is_final: bool = False):
-        await self.chunks.put((chunk, is_final))
-        if is_final:
-            self.final_chunk_sent = True
-    
-    def __aiter__(self):
-        return self
-    
-    async def __anext__(self):
-        if self.final_chunk_sent and self.chunks.empty():
-            raise StopAsyncIteration
-        chunk, is_final = await self.chunks.get()
-        return chunk
-
-@app.post("/start-stream", response_model=StartStreamResponse)
-async def start_stream(request: StartStreamingRequest):
-    """Initialize a streaming session"""
-    try:
-        if REALTIME_PROCESSOR is None:
-            return StartStreamResponse(
-                status="error",
-                session_id=request.session_id,
-                message="Real-time processor not available"
-            )
-        
-        # Create chunk generator and session
-        chunk_generator = AudioChunkGenerator()
-        session = StreamingSession(
-            session_id=request.session_id,
-            chunk_generator=chunk_generator,
-            realtime_processor=REALTIME_PROCESSOR
-        )
-        
-        # Store session
-        with _session_lock:
-            _streaming_sessions[request.session_id] = session
-        
-        # Start background processing
-        asyncio.create_task(_process_realtime_stream(session))
-        
-        return StartStreamResponse(
-            status="success",
-            session_id=request.session_id,
-            message="Streaming session started"
-        )
-        
-    except Exception as e:
-        logger.error(f"Start stream error: {e}")
-        return StartStreamResponse(
-            status="error",
-            session_id=request.session_id,
-            message=f"Failed to start stream: {str(e)}"
-        )
-
-@app.post("/stream-audio", response_model=StreamAudioResponse)
-async def stream_audio(request: StreamAudioRequest):
-    """Process streaming audio chunks in real-time"""
-    try:
-        with _session_lock:
-            session = _streaming_sessions.get(request.session_id)
-            if not session:
-                return StreamAudioResponse(
-                    status="error",
-                    partial_transcript="",
-                    entities=[],
-                    soap_note="",
-                    is_complete=False
-                )
-        
-        # Decode audio chunk
-        audio_data = base64.b64decode(request.audio_chunk)
-        
-        # Add chunk to generator for processing
-        await session.chunk_generator.put_chunk(audio_data, request.is_final)
-        
-        # Return the latest results if available
-        latest = session.latest_results or {}
-        
-        return StreamAudioResponse(
-            status="success",
-            partial_transcript=latest.get("partial_transcript", "Processing..."),
-            entities=latest.get("entities", []),
-            soap_note=latest.get("soap_note", ""),
-            is_complete=request.is_final or latest.get("is_complete", False)
-        )
-        
-    except Exception as e:
-        logger.error(f"Stream audio error: {e}")
-        return StreamAudioResponse(
-            status="error",
-            partial_transcript="",
-            entities=[],
-            soap_note="",
-            is_complete=False
-        )
-
-
-# =============================================================================
-# DEEPSCRIBE-LIKE WEBSOCKET ENDPOINT
+# WEBSOCKET ENDPOINT
 # =============================================================================
 @app.websocket("/ws/realtime-audio")
 async def websocket_realtime_audio(websocket: WebSocket):
@@ -1867,114 +1678,17 @@ async def websocket_realtime_audio(websocket: WebSocket):
     finally:
         logger.info(f"🔚 WebSocket session ended: {session_id}")
 
-
-def _convert_realtime_result_to_response(realtime_result: RealtimeResult) -> dict:
-    """Convert RealTimeMedicalProcessor result to client response format"""
-    base_response = {
-        "type": realtime_result.type,
-        "session_id": realtime_result.session_id,
-        "is_complete": realtime_result.type in ["soap_note_complete", "processing_complete"]
-    }
-    
-    response_data = {**base_response}
-    
-    if realtime_result.type == "transcript":
-        response_data.update({
-            "partial_transcript": realtime_result.data.get("text", ""),
-            "entities": [],
-            "soap_note": ""
-        })
-    elif realtime_result.type == "entities":
-        response_data.update({
-            "partial_transcript": "",
-            "entities": realtime_result.data.get("entities", []),
-            "soap_note": ""
-        })
-    elif realtime_result.type == "soap_update":
-        # Combine all SOAP sections
-        current_sections = realtime_result.data.get("current_sections", {})
-        soap_content = "\n".join([f"{section.upper()}:\n{content}" 
-                                for section, content in current_sections.items() 
-                                if content])
-        response_data.update({
-            "partial_transcript": "",
-            "entities": [],
-            "soap_note": soap_content
-        })
-    elif realtime_result.type == "soap_note_complete":
-        response_data.update({
-            "partial_transcript": "",
-            "entities": [],
-            "soap_note": realtime_result.data.get("content", ""),
-            "is_complete": True
-        })
-    elif realtime_result.type == "medical_alert":
-        response_data.update({
-            "partial_transcript": "",
-            "entities": [],
-            "soap_note": f"Medical Alert: {realtime_result.data.get('alerts', [])}"
-        })
-    
-    return response_data
-
-@app.post("/end-stream", response_model=EndStreamResponse)
-async def end_stream(request: EndStreamRequest):
-    """Finalize streaming session and return complete results"""
-    try:
-        with _session_lock:
-            session = _streaming_sessions.get(request.session_id)
-            if not session:
-                return EndStreamResponse(
-                    status="error",
-                    final_transcript="",
-                    entities=[],
-                    soap_note="",
-                    session_duration=0
-                )
-            
-            # Mark as final
-            await session.chunk_generator.put_chunk(b"", is_final=True)
-            
-            # Wait a moment for final processing
-            await asyncio.sleep(2.0)
-            
-            # Get final results from session
-            final_results = session.latest_results or {}
-            
-            # Cleanup session
-            del _streaming_sessions[request.session_id]
-            
-            return EndStreamResponse(
-                status="completed",
-                final_transcript=final_results.get("partial_transcript", ""),
-                entities=final_results.get("entities", []),
-                soap_note=final_results.get("soap_note", ""),
-                session_duration=time.time() - session.start_time
-            )
-            
-    except Exception as e:
-        logger.error(f"End stream error: {e}")
-        return EndStreamResponse(
-            status="error",
-            final_transcript="",
-            entities=[],
-            soap_note="",
-            session_duration=0
-        )
-
 @app.get("/health")
 async def health():
     return {
         "status": "healthy",
         "models_loaded": {
-            "sentence_transformer": SENTENCE_MODEL is not None,
             "whisper": WHISPER_MODEL is not None,
             "biobert": BIOBERT_MODEL is not None,
             "spacy": SPACY_MODEL is not None,
             "medical_llm": MEDICAL_LLM is not None
         },
         "thread_pools": {
-            "sentence_pool": SENTENCE_POOL._max_workers,
             "whisper_pool": WHISPER_POOL._max_workers,
             "biobert_pool": BIOBERT_POOL._max_workers,
             "spacy_pool": SPACY_POOL._max_workers,
@@ -1984,20 +1698,6 @@ async def health():
         "timestamp": time.time()
     }
 
-@app.get("/model-info")
-async def model_info():
-    if SENTENCE_MODEL is not None:
-        return {
-            "model_name": "all-MiniLM-L6-v2",
-            "embedding_dimension": SENTENCE_MODEL.get_sentence_embedding_dimension(),
-            "status": "loaded"
-        }
-    return {
-        "model_name": "universal-fallback",
-        "embedding_dimension": 384,
-        "status": "fallback"
-    }
-
 @app.get("/")
 async def root():
     return {
@@ -2005,7 +1705,6 @@ async def root():
         "version": "2.0.0",
         "endpoints": {
             "/process-audio": "Process audio for medical transcription and SOAP generation",
-            "/embed": "Generate text embeddings",
             "/health": "Service health check",
             "/model-info": "Model information"
         }
