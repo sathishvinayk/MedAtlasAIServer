@@ -3,6 +3,8 @@ import websockets
 import json
 import sys
 import os
+import base64  # ADDED
+import time    # ADDED
 
 class SimpleDeepScribeClient:
     """
@@ -34,7 +36,7 @@ class SimpleDeepScribeClient:
         print("🔌 Disconnected")
     
     async def send_audio_file(self, file_path: str, chunk_size=4096):
-        """Stream audio file with better final processing handling"""
+        """Stream audio file with proper final processing handling"""
         if not await self.connect():
             return False
         
@@ -47,45 +49,35 @@ class SimpleDeepScribeClient:
                 file_size = os.path.getsize(file_path)
                 print(f"📁 Streaming {file_path} ({file_size} bytes)...")
                 
-                # Skip WAV header if present (44 bytes)
-                header = f.read(44)
-                if header.startswith(b'RIFF'):
-                    print("🎵 Detected WAV file, skipping header")
-                    audio_data = f.read()
-                else:
-                    # Not a WAV file, read everything
-                    f.seek(0)
-                    audio_data = f.read()
-                
+                audio_data = f.read()
                 total_chunks = len(audio_data) // chunk_size + (1 if len(audio_data) % chunk_size else 0)
                 
                 for i in range(0, len(audio_data), chunk_size):
                     chunk = audio_data[i:i + chunk_size]
-                    await self.websocket.send(chunk)
+                    chunk_b64 = base64.b64encode(chunk).decode('utf-8')
+                    await self.websocket.send(chunk_b64)
                     
                     # Show progress
-                    if i % (chunk_size * 10) == 0:  # Every 10 chunks
+                    if i % (chunk_size * 10) == 0:
                         progress = (i / len(audio_data)) * 100
-                        print(f"📊 Progress: {progress:.1f}%")
+                        print(f"📊 Progress: {progress:.1f}% ({i}/{len(audio_data)} bytes)")
                     
-                    # Small delay to simulate real-time
                     await asyncio.sleep(0.01)
             
             print("✅ File streaming complete")
             
-            # CRITICAL: Wait much longer for final processing
-            print("⏳ Waiting for final processing (this may take 30-60 seconds)...")
+            # Send end stream signal
+            await self.websocket.send("END_STREAM")
+            print("📤 Sent END_STREAM signal")
             
-            # Wait for final results with progress updates
-            for i in range(120):  # Wait up to 60 seconds
-                await asyncio.sleep(1.0)
-                if i % 10 == 0:  # Print progress every 10 seconds
-                    print(f"⏰ Waiting... {i}s elapsed")
-            
-            print("ℹ️  Final processing should be complete. If no results, check server logs.")
-            
-            # Cancel listener after waiting
-            listener_task.cancel()
+            # Wait for listener to complete naturally
+            print("⏳ Waiting for final processing...")
+            try:
+                await asyncio.wait_for(listener_task, timeout=560.0)  # 60 second timeout
+                print("✅ Processing completed successfully")
+            except asyncio.TimeoutError:
+                print("❌ Processing timeout - taking too long")
+                listener_task.cancel()
             
             return True
             
@@ -94,7 +86,7 @@ class SimpleDeepScribeClient:
             return False
         finally:
             await self.disconnect()
-    
+            
     async def _listen_for_results(self):
         """Listen for real-time results from server"""
         try:
@@ -110,7 +102,10 @@ class SimpleDeepScribeClient:
             result_type = result.get('type', 'unknown')
             data = result.get('data', {})
             
-            if result_type == "transcript":
+            if result_type == "connected":
+                print(f"🔗 {data.get('message', 'Connected to server')}")
+            
+            elif result_type == "transcript":
                 transcript = data.get('text', '')
                 if transcript:
                     prefix = "⏳" if result.get('is_partial', True) else "✅"
@@ -137,18 +132,33 @@ class SimpleDeepScribeClient:
                 print(f"Model Used: {data.get('model_used', 'unknown')}")
                 print(f"Final SOAP Note:\n{soap_note}")
                 print("="*60)
-            
-            elif result_type == "error":
-                print(f"❌ Server Error: {data.get('message', 'Unknown error')}")
+                # Exit successfully when we get the complete SOAP note
+                return "COMPLETE"
             
             elif result_type == "keepalive":
                 # Silently handle keepalive messages
                 pass
                 
+            elif result_type == "error":
+                print(f"❌ Server Error: {data.get('message', 'Unknown error')}")
+                return "ERROR"
+            
         except json.JSONDecodeError:
             print(f"📥 Raw message: {message}")
         except Exception as e:
             print(f"❌ Error handling result: {e}")
+        
+        return "CONTINUE"
+
+    async def _listen_for_results(self):
+        """Listen for real-time results from server"""
+        try:
+            async for message in self.websocket:
+                status = await self._handle_result(message)
+                if status in ["COMPLETE", "ERROR"]:
+                    break  # Stop listening when processing is complete
+        except Exception as e:
+            print(f"❌ Result listening error: {e}")
     
     async def test_connection(self):
         """Test server connection"""
@@ -196,12 +206,4 @@ async def main():
         print("❌ Invalid command")
 
 if __name__ == "__main__":
-    # Check if websockets is installed
-    try:
-        import websockets
-    except ImportError:
-        print("❌ websockets module not installed")
-        print("Install it with: pip install websockets")
-        sys.exit(1)
-    
     asyncio.run(main())

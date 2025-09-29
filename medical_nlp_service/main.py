@@ -15,6 +15,8 @@ from contextlib import asynccontextmanager
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 import torch
+import base64 
+import time    
 from transformers import (
     AutoTokenizer, 
     AutoModelForCausalLM, 
@@ -1257,80 +1259,84 @@ class RealTimeMedicalProcessor:
             logger.error(f"Entity extraction error: {e}")
             return []
     
-    async def _generate_final_results(self, patient_context: PatientContext, 
-                               full_transcript: str) -> AsyncGenerator[RealtimeResult, None]:
-        """Generate final results with timeout handling"""
-        logger.info(f"Generating final results for transcript: {len(full_transcript)} characters")
-        
+    async def _generate_final_results_fast(self, patient_context: PatientContext, 
+                                full_transcript: str) -> AsyncGenerator[RealtimeResult, None]:
+        """Fast final results generation with minimal processing"""
+        logger.info(f"🚀 FAST FINAL: Generating quick results for {len(full_transcript)} chars")
+        print("🔔 DEBUG: _generate_final_results METHOD ENTERED!")
+        print(f"🔔 DEBUG: Session {patient_context.session_id}")
+        print(f"🔔 DEBUG: Transcript length: {len(full_transcript)}")
         try:
-            # Send a progress update
+            # Send immediate progress
             yield RealtimeResult(
                 type="progress",
-                data={"message": "Generating final SOAP note..."},
+                data={"message": "Finalizing results..."},
                 session_id=patient_context.session_id,
                 is_partial=False
             )
             
-            # Extract final entities
-            logger.info("Extracting final entities...")
-            final_entities, model_used = await asyncio.get_event_loop().run_in_executor(
-                self.processing_pool,
-                extract_medical_entities_sync, full_transcript
-            )
+            final_entities = await self._extract_medical_entities_fast(full_transcript)
+
+            # Quick entity extraction (skip slow models)
+            logger.info("🔄 Quick entity extraction...")
+            simple_entities = []
+            try:
+                # Use only fast keyword extraction for final processing
+                simple_entities = await asyncio.wait_for(
+                    self._extract_medical_entities_fast(full_transcript),
+                    timeout=5.0
+                )
+                logger.info(f"✅ Quick entities found: {len(simple_entities)}")
+            except asyncio.TimeoutError:
+                logger.warning("Quick entity extraction timeout")
             
-            logger.info(f"Final entities extracted: {len(final_entities)} entities using {model_used}")
-            
-            # Generate SOAP note
-            logger.info("Generating SOAP note...")
-            if self.medical_llm:
-                try:
-                    soap_note = await asyncio.wait_for(
-                        asyncio.get_event_loop().run_in_executor(
-                            self.processing_pool,
-                            generate_soap_note_llm, full_transcript, final_entities
-                        ),
-                        timeout=30.0  # 30 second timeout for LLM
-                    )
-                    logger.info("SOAP note generated using LLM")
-                except asyncio.TimeoutError:
-                    logger.warning("LLM SOAP generation timeout, using rule-based")
-                    soap_note = generate_soap_note_rule_based(full_transcript, final_entities)
-            else:
-                soap_note = generate_soap_note_rule_based(full_transcript, final_entities)
-                logger.info("SOAP note generated using rule-based")
+            # Generate simple SOAP note quickly
+            logger.info("🔄 Generating quick SOAP note...")
+            soap_note = ""
+            try:
+                # Use rule-based generation only (faster than LLM)
+                soap_note = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        self.processing_pool,
+                        self._generate_quick_soap_note, full_transcript, simple_entities
+                    ),
+                    timeout=10.0
+                )
+                logger.info("✅ Quick SOAP note generated")
+            except asyncio.TimeoutError:
+                soap_note = "Summary: Medical conversation processed. Full SOAP note generation timed out."
+                logger.warning("SOAP note generation timeout, using fallback")
             
             # Calculate session duration
             session_duration = time.time() - patient_context.start_time
             
-            logger.info(f"Final processing complete: {len(soap_note)} characters, duration: {session_duration:.2f}s")
-            
+            logger.info(f"🎉 FAST FINAL COMPLETE: {len(soap_note)} chars, {session_duration:.2f}s")
+
+            print(f"\n" + "="*80)
+            print("🎉 FINAL SOAP NOTE GENERATED - COMPLETE OUTPUT:")
+            print("="*80)
+            print(soap_note)  # This prints the ENTIRE SOAP note
+            print("="*80)
+            print(f"📊 Stats: {len(soap_note)} chars, {len(final_entities)} entities, {session_duration:.2f}s duration")
+            print("="*80 + "\n")
             # Yield final results
             yield RealtimeResult(
                 type="soap_note_complete",
                 data={
                     "content": soap_note,
                     "is_complete": True,
-                    "entities_found": len(final_entities),
-                    "model_used": model_used,
+                    "entities_found": len(simple_entities),
+                    "model_used": "quick_generation",
                     "session_duration": session_duration,
-                    "transcript_length": len(full_transcript)
+                    "transcript_length": len(full_transcript),
+                    "note": "Quick generation completed successfully"
                 },
                 session_id=patient_context.session_id,
                 is_partial=False
             )
             
-            logger.info(f"Final results sent for session {patient_context.session_id}")
-            
-        except asyncio.TimeoutError:
-            logger.error("Final results generation timeout")
-            yield RealtimeResult(
-                type="error",
-                data={"message": "Final processing timeout - server took too long to generate SOAP note"},
-                session_id=patient_context.session_id,
-                is_partial=False
-            )
         except Exception as e:
-            logger.error(f"Final results generation error: {e}")
+            logger.error(f"💥 Fast final results error: {e}")
             yield RealtimeResult(
                 type="error", 
                 data={"message": f"Final processing error: {str(e)}"},
@@ -1338,6 +1344,35 @@ class RealTimeMedicalProcessor:
                 is_partial=False
             )
 
+    def _generate_quick_soap_note(self, transcript: str, entities: List[MedicalEntity]) -> str:
+        """Generate a quick SOAP note without LLM"""
+        try:
+            # Extract basic information using simple rules
+            symptoms = [e.text for e in entities if e.entity == "SYMPTOM"]
+            medications = [e.text for e in entities if e.entity == "MEDICATION"]
+            diagnoses = [e.text for e in entities if e.entity == "DIAGNOSIS"]
+            
+            soap_note = f"""SOAP NOTE - QUICK GENERATION
+
+    SUBJECTIVE:
+    Patient reported: {transcript[:500]}...
+
+    Key symptoms: {', '.join(symptoms) if symptoms else 'None identified'}
+
+    OBJECTIVE:
+    Medications discussed: {', '.join(medications) if medications else 'None identified'}
+
+    ASSESSMENT:
+    Potential conditions: {', '.join(diagnoses) if diagnoses else 'Discussion of symptoms and treatment'}
+
+    PLAN:
+    Follow up as discussed. Consider formal SOAP note generation for detailed analysis.
+
+    NOTE: This is an automatically generated quick summary. For detailed analysis, process with full medical LLM.
+    """
+            return soap_note
+        except Exception as e:
+            return f"Quick SOAP note generation failed: {str(e)}"
 
 # =============================================================================
 # WEBSOCKET MANAGER FOR REAL-TIME STREAMING
@@ -1506,7 +1541,10 @@ async def stream_audio(request: StreamAudioRequest):
 # =============================================================================
 @app.websocket("/ws/realtime-audio")
 async def websocket_realtime_audio(websocket: WebSocket):
-    """Simplified and more reliable WebSocket endpoint"""
+    websocket._receive_timeout = 300  # 5 minutes
+    websocket._send_timeout = 300     # 5 minutes
+
+    """WebSocket handler with aggressive keepalive during final processing"""
     session_id = f"realtime_{int(time.time())}_{uuid.uuid4().hex[:8]}"
     
     await websocket.accept()
@@ -1519,34 +1557,58 @@ async def websocket_realtime_audio(websocket: WebSocket):
             "data": {"session_id": session_id, "message": "Ready for audio streaming"}
         })
         
-        # Collect all audio data first, then process
-        audio_chunks = []
+        last_activity = time.time()
+        processing_complete = False
         
-        # Receive all audio chunks
-        try:
-            while True:
-                audio_data = await asyncio.wait_for(websocket.receive_bytes(), timeout=300.0)
-                audio_chunks.append(audio_data)
-                # Send progress update
-                if len(audio_chunks) % 50 == 0:
-                    await websocket.send_json({
-                        "type": "progress",
-                        "data": {"chunks_received": len(audio_chunks), "message": "Receiving audio..."}
-                    })
-        except asyncio.TimeoutError:
-            logger.info(f"⏰ Audio reception complete for {session_id}: {len(audio_chunks)} chunks")
-        except WebSocketDisconnect:
-            logger.info(f"🔌 WebSocket disconnected during reception: {session_id}")
+        async def audio_generator():
+            """Convert WebSocket messages to async generator"""
+            nonlocal last_activity
+            try:
+                while True:
+                    try:
+                        # Use wait_for to handle timeouts
+                        message = await asyncio.wait_for(websocket.receive(), timeout=30.0)
+                        last_activity = time.time()
+                        
+                        if message["type"] == "websocket.disconnect":
+                            logger.info(f"Client disconnected: {session_id}")
+                            break
+                        
+                        if message["type"] == "websocket.receive":
+                            if "text" in message:
+                                if message["text"] == "END_STREAM":
+                                    logger.info(f"End stream signal received for {session_id}")
+                                    break
+                                
+                                # Decode base64 audio data
+                                audio_data = base64.b64decode(message["text"])
+                                yield audio_data
+                            
+                            elif "bytes" in message:
+                                yield message["bytes"]
+                                
+                    except asyncio.TimeoutError:
+                        # Send keepalive ping more frequently during processing
+                        try:
+                            await websocket.send_json({"type": "keepalive", "data": {"message": "ping"}})
+                            logger.debug("Sent keepalive ping")
+                            
+                            # If we haven't had activity in a while and processing should be complete, break
+                            if processing_complete and time.time() - last_activity > 10:
+                                break
+                                
+                        except:
+                            break  # Client disconnected
+                            
+            except WebSocketDisconnect:
+                logger.info(f"WebSocket disconnected: {session_id}")
         
-        # Process all collected audio
-        if audio_chunks:
-            logger.info(f"🎯 Starting processing for {session_id} with {len(audio_chunks)} chunks")
-            
-            async def combined_audio_stream():
-                for chunk in audio_chunks:
-                    yield chunk
-            
-            async for result in REALTIME_PROCESSOR.process_realtime_stream(session_id, combined_audio_stream()):
+        # Process audio stream in real-time
+        logger.info(f"🎯 Starting real-time processing for {session_id}")
+        
+        async for result in REALTIME_PROCESSOR.process_realtime_stream(session_id, audio_generator()):
+            # Send each result back to client
+            try:
                 await websocket.send_json({
                     "type": result.type,
                     "data": result.data,
@@ -1554,51 +1616,107 @@ async def websocket_realtime_audio(websocket: WebSocket):
                     "is_partial": result.is_partial,
                     "timestamp": result.timestamp
                 })
-        else:
-            await websocket.send_json({
-                "type": "error",
-                "data": {"message": "No audio data received"}
-            })
+                last_activity = time.time()
                 
-    except WebSocketDisconnect:
-        logger.info(f"🔌 WebSocket disconnected: {session_id}")
+                # Check if this is the final result
+                if result.type == "soap_note_complete":
+                    processing_complete = True
+                    logger.info(f"✅ Final SOAP note sent for {session_id}")
+                    
+            except Exception as e:
+                logger.error(f"Error sending result to client: {e}")
+                break
+                
+        logger.info(f"🏁 Processing completed for {session_id}")
+                
     except Exception as e:
         logger.error(f"💥 WebSocket error: {e}", exc_info=True)
         try:
             await websocket.send_json({
-                "type": "error",
+                "type": "error", 
                 "data": {"message": f"Server error: {str(e)}"}
             })
         except:
             pass
     finally:
-        logger.info(f"🏁 WebSocket session ended: {session_id}")
+        logger.info(f"🔚 WebSocket session ended: {session_id}")
 
-async def process_realtime_stream_with_timeout(session_id: str, audio_stream: AsyncGenerator[bytes, None]):
-    """Process real-time stream with proper error handling"""
+async def process_realtime_stream(self, session_id: str, 
+                               audio_stream: AsyncGenerator[bytes, None]) -> AsyncGenerator[RealtimeResult, None]:
+    """
+    Ensure final processing completes quickly
+    """
+    logger.info(f"🚀 STARTING processing for session: {session_id}")
+    
+    patient_context = PatientContext(session_id=session_id)
+    
+    with self.session_lock:
+        self.active_sessions[session_id] = patient_context
+    
     try:
-        async for result in REALTIME_PROCESSOR.process_realtime_stream(session_id, audio_stream):
-            # Send results back to client
-            await connection_manager.send_realtime_result(session_id, result)
+        buffer_count = 0
+        
+        async for audio_chunk in audio_stream:
+            buffer_count += 1
+            self.audio_processor.add_audio_to_buffer(patient_context.audio_buffer, audio_chunk)
             
-            # Check if processing is complete
-            if result.type == "soap_note_complete":
-                logger.info(f"Real-time processing completed for {session_id}")
-                break
+            # Process every 50 chunks to avoid backlog
+            if buffer_count % 50 == 0:
+                logger.info(f"🔄 Processing chunk {buffer_count}, buffer size: {len(patient_context.audio_buffer)}")
+                async for result in self._process_audio_buffer(patient_context, is_final=False):
+                    yield result
+                # Clear buffer after processing to prevent duplicates
+                patient_context.audio_buffer.clear()
+        
+        # CRITICAL FIX: The stream has ended - process final buffer immediately
+        logger.info(f"🎬 STREAM ENDED for {session_id}. Buffer count: {buffer_count}, Final buffer size: {len(patient_context.audio_buffer)}")
+        
+        if patient_context.audio_buffer:
+            logger.info(f"📦 Processing final buffer ({len(patient_context.audio_buffer)} bytes)")
+            async for result in self._process_audio_buffer(patient_context, is_final=True):
+                yield result
+            patient_context.audio_buffer.clear()
+        else:
+            logger.info("📦 No final buffer to process")
+        
+        # Force final results regardless of buffer - USE FAST VERSION
+        if patient_context.conversation_history:
+            transcript_count = len(patient_context.conversation_history)
+            total_chars = sum(len(t) for t in patient_context.conversation_history)
+            logger.info(f"📄 Generating FAST final results from {transcript_count} transcripts ({total_chars} chars)")
+            
+            full_transcript = " ".join(patient_context.conversation_history)
+            async for result in self._generate_final_results_fast(patient_context, full_transcript):
+                yield result
+        else:
+            logger.warning("❌ No conversation history for final processing")
+            yield RealtimeResult(
+                type="error",
+                data={"message": "No audio was transcribed successfully"},
+                session_id=session_id,
+                is_partial=False
+            )
+                
     except Exception as e:
-        logger.error(f"Stream processing error for {session_id}: {e}")
-        await connection_manager.send_realtime_result(session_id, RealtimeResult(
+        logger.error(f"💥 Stream processing error: {e}", exc_info=True)
+        yield RealtimeResult(
             type="error",
-            data={"message": f"Stream processing error: {str(e)}"},
+            data={"message": f"Processing error: {str(e)}"},
             session_id=session_id,
             is_partial=False
-        ))
+        )
+    finally:
+        with self.session_lock:
+            if session_id in self.active_sessions:
+                del self.active_sessions[session_id]
+        logger.info(f"🧹 Cleaned up session: {session_id}")
 
 async def process_realtime_stream(self, session_id: str, 
                                audio_stream: AsyncGenerator[bytes, None]) -> AsyncGenerator[RealtimeResult, None]:
     """
     Ensure final processing completes
     """
+    print(f"🚀 DEBUG: process_realtime_stream STARTED for {session_id}")
     logger.info(f"Starting processing for session: {session_id}")
     
     # Initialize patient context
@@ -1631,6 +1749,8 @@ async def process_realtime_stream(self, session_id: str,
         if patient_context.conversation_history:
             logger.info(f"Generating final SOAP note from {len(patient_context.conversation_history)} transcripts")
             full_transcript = " ".join(patient_context.conversation_history)
+            print("🎯 DEBUG: ABOUT TO CALL _generate_final_results!")
+            print(f"🎯 DEBUG: Conversation history count: {len(patient_context.conversation_history)}")
             async for result in self._generate_final_results(patient_context, full_transcript):
                 yield result
         else:
