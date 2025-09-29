@@ -1,6 +1,6 @@
 from utils import normalize_medication_name
 from typing import List
-from entities import MedicalEntity
+from shared_models import MedicalEntity
 import re
 
 def generate_soap_note_rule_based(transcript: str, entities: List[MedicalEntity]) -> str:

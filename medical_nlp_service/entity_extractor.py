@@ -1,5 +1,5 @@
 from typing import List
-from entities import MedicalEntity
+from shared_models import MedicalEntity
 from constants import MEDICAL_KEYWORDS, MEDICATION_SYNONYMS
 import re
 import logging

@@ -8,7 +8,7 @@ import os
 import tempfile
 from contextlib import asynccontextmanager
 from constants import MEDICAL_KEYWORDS, MEDICATION_SYNONYMS
-from entities import SpeakerSegment
+from shared_models import SpeakerSegment
 
 logger = logging.getLogger("medical-nlp-service")
 
