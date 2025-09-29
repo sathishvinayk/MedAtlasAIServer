@@ -96,59 +96,25 @@ class SimpleDeepScribeClient:
             print(f"❌ Result listening error: {e}")
     
     async def _handle_result(self, message: str):
-        """Handle server results with progress tracking"""
         try:
             result = json.loads(message)
             result_type = result.get('type', 'unknown')
-            data = result.get('data', {})
             
-            if result_type == "connected":
-                print(f"🔗 {data.get('message', 'Connected to server')}")
-            
-            elif result_type == "transcript":
-                transcript = data.get('text', '')
-                if transcript:
-                    prefix = "⏳" if result.get('is_partial', True) else "✅"
-                    print(f"{prefix} Transcript: {transcript}")
-            
-            elif result_type == "entities":
-                entities = data.get('entities', [])
-                if entities:
-                    entity_list = [f"{e.get('entity', 'unknown')}: {e.get('text', '')}" for e in entities]
-                    print(f"🏥 Entities: {', '.join(entity_list)}")
-            
-            elif result_type == "progress":
-                print(f"📈 {data.get('message', 'Processing...')}")
+            if result_type == "soap_update":
+                soap_note = result.get('data', {}).get('soap_note', '')
+                if soap_note:
+                    print(f"📝 SOAP Update: {soap_note[:100]}...")
             
             elif result_type == "soap_note_complete":
-                soap_note = data.get('content', '')
-                duration = data.get('session_duration', 0)
-                print("\n" + "="*60)
-                print("🎉 PROCESSING COMPLETE!")
-                print("="*60)
-                print(f"Session Duration: {duration:.2f}s")
-                print(f"Transcript Length: {data.get('transcript_length', 0)} chars")
-                print(f"Entities Found: {data.get('entities_found', 0)}")
-                print(f"Model Used: {data.get('model_used', 'unknown')}")
-                print(f"Final SOAP Note:\n{soap_note}")
-                print("="*60)
-                # Exit successfully when we get the complete SOAP note
+                soap_note = result.get('data', {}).get('content', '')
+                print(f"\n🎉 FINAL SOAP NOTE RECEIVED!")
+                print("=" * 60)
+                print(soap_note)
+                print("=" * 60)
                 return "COMPLETE"
-            
-            elif result_type == "keepalive":
-                # Silently handle keepalive messages
-                pass
                 
-            elif result_type == "error":
-                print(f"❌ Server Error: {data.get('message', 'Unknown error')}")
-                return "ERROR"
-            
-        except json.JSONDecodeError:
-            print(f"📥 Raw message: {message}")
         except Exception as e:
-            print(f"❌ Error handling result: {e}")
-        
-        return "CONTINUE"
+            print(f"Error handling result: {e}")
 
     async def _listen_for_results(self):
         """Listen for real-time results from server"""

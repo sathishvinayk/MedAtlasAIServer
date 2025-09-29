@@ -898,21 +898,89 @@ class ProgressiveSOAPBuilder:
             }
         }
     
-    def update_soap_section(self, current_section: str, new_content: str, 
-                          conversation_phase: str, intent: str) -> str:
-        """Progressively update SOAP sections based on new content"""
-        if not current_section:
+    def update_soap_sections(self, current_sections: Dict[str, str], 
+                           transcript: str, entities: List[MedicalEntity],
+                           conversation_phase: str) -> Dict[str, str]:
+        """Update SOAP sections based on new content and conversation context"""
+        updated_sections = current_sections.copy()
+        
+        # Analyze content and update appropriate sections
+        if conversation_phase == "symptom_reporting":
+            updated_sections["subjective"] = self._add_to_section(
+                updated_sections["subjective"], 
+                self._extract_symptom_content(transcript, entities)
+            )
+        
+        elif conversation_phase == "history_taking":
+            updated_sections["subjective"] = self._add_to_section(
+                updated_sections["subjective"],
+                self._extract_history_content(transcript, entities)
+            )
+        
+        elif conversation_phase == "questioning":
+            # Doctor questions might go to objective or help structure assessment
+            updated_sections["objective"] = self._add_to_section(
+                updated_sections["objective"],
+                self._extract_clinical_findings(transcript, entities)
+            )
+        
+        # Always update assessment and plan based on new information
+        updated_sections["assessment"] = self._update_assessment(updated_sections, entities)
+        updated_sections["plan"] = self._update_plan(updated_sections, entities)
+        
+        return updated_sections
+    
+    def _add_to_section(self, current_content: str, new_content: str) -> str:
+        """Add new content to a section without duplication"""
+        if not new_content.strip():
+            return current_content
+        
+        if new_content in current_content:
+            return current_content
+        
+        if current_content:
+            return current_content + ". " + new_content
+        else:
             return new_content
+    
+    def _extract_symptom_content(self, transcript: str, entities: List[MedicalEntity]) -> str:
+        """Extract symptom-related content for subjective section"""
+        symptoms = [e.text for e in entities if e.entity == "SYMPTOM"]
+        if symptoms:
+            return f"Reports {', '.join(symptoms)}"
+        return ""
+    
+    def _extract_history_content(self, transcript: str, entities: List[MedicalEntity]) -> str:
+        """Extract history-related content"""
+        medications = [e.text for e in entities if e.entity == "MEDICATION"]
+        conditions = [e.text for e in entities if e.entity in ["DIAGNOSIS", "CONDITION"]]
         
-        # Avoid duplication
-        if new_content in current_section:
-            return current_section
+        parts = []
+        if medications:
+            parts.append(f"Current medications: {', '.join(medications)}")
+        if conditions:
+            parts.append(f"History of {', '.join(conditions)}")
         
-        # Add based on conversation context
-        if conversation_phase == "symptom_reporting" and "subjective" in current_section.lower():
-            return current_section + " " + new_content
-        
-        return current_section
+        return ". ".join(parts)
+    
+    def _extract_clinical_findings(self, transcript: str, entities: List[MedicalEntity]) -> str:
+        """Extract objective findings from clinical discussion"""
+        # This would be enhanced with vital signs, exam findings, etc.
+        return "Clinical discussion regarding patient condition."
+    
+    def _update_assessment(self, sections: Dict[str, str], entities: List[MedicalEntity]) -> str:
+        """Update assessment based on current information"""
+        symptoms = [e.text for e in entities if e.entity == "SYMPTOM"]
+        if symptoms:
+            return f"Assessment of {', '.join(symptoms[:2])}"
+        return "Ongoing assessment"
+    
+    def _update_plan(self, sections: Dict[str, str], entities: List[MedicalEntity]) -> str:
+        """Update plan based on current information"""
+        medications = [e.text for e in entities if e.entity == "MEDICATION"]
+        if medications:
+            return f"Consider {medications[0]} management"
+        return "Continue evaluation and management"
 
 class RealTimeMedicalProcessor:
     """Optimized real-time medical audio processor"""
@@ -924,6 +992,8 @@ class RealTimeMedicalProcessor:
         self.pyannote_pipeline = pyannote_pipeline
         self.biobert_model = biobert_model
         self.spacy_model = spacy_model
+        self.soap_builder = ProgressiveSOAPBuilder()
+        self.conversation_analyzer = MedicalConversationAnalyzer()
         
         # Real-time processing with optimizations
         self.audio_processor = AudioStreamProcessor()
@@ -938,6 +1008,64 @@ class RealTimeMedicalProcessor:
         self.processing_interval = 5.0  # Process every 5 seconds
         
         logger.info("Optimized RealTimeMedicalProcessor initialized")
+    
+    def _format_current_soap(self, sections: Dict[str, str]) -> str:
+        """Format the current SOAP state for sending to client"""
+        soap_note = ""
+        for section, content in sections.items():
+            if content.strip():
+                soap_note += f"{section.upper()}:\n{content}\n\n"
+        return soap_note.strip()
+
+    async def _update_progressive_soap(self, patient_context: PatientContext, transcript: str, entities: List[MedicalEntity]):
+        """Update SOAP note progressively using the sophisticated rule-based generator"""
+        
+        # Combine all transcripts so far for context
+        all_transcripts = " ".join(patient_context.conversation_history + [transcript])
+        
+        # Combine all entities - FIXED:
+        all_entities = patient_context.extracted_entities.copy()  # All previous entities
+        all_entities.extend(entities)  # Add new entities
+        
+        print(f"🔍 DEBUG: {len(patient_context.conversation_history)} transcripts, {len(entities)} new entities")
+        print(f"🔍 DEBUG: Total unique entities: {len(all_entities)}")
+        
+        # Use your sophisticated rule-based generator
+        current_soap = generate_soap_note_rule_based(all_transcripts, all_entities)
+        
+        print(f"🔍 DEBUG: Generated SOAP length: {len(current_soap)}")
+        if current_soap:
+            print(f"🔍 DEBUG: SOAP preview: {current_soap[:200]}...")
+        else:
+            print("❌ DEBUG: SOAP generation returned empty!")
+        
+        # Update patient context with current SOAP state
+        patient_context.soap_note_sections = self._parse_soap_to_sections(current_soap)
+        
+        return current_soap
+
+    def _parse_soap_to_sections(self, soap_note: str) -> Dict[str, str]:
+        """Parse the rule-based SOAP note back into sections for progressive updates"""
+        sections = {"subjective": "", "objective": "", "assessment": "", "plan": ""}
+        
+        current_section = None
+        for line in soap_note.split('\n'):
+            line = line.strip()
+            if line.startswith('SUBJECTIVE:'):
+                current_section = "subjective"
+            elif line.startswith('OBJECTIVE:'):
+                current_section = "objective"
+            elif line.startswith('ASSESSMENT:'):
+                current_section = "assessment"
+            elif line.startswith('PLAN:'):
+                current_section = "plan"
+            elif current_section and line and not line.startswith('-'):
+                if sections[current_section]:
+                    sections[current_section] += " " + line
+                else:
+                    sections[current_section] = line
+        
+        return sections
     
     async def _extract_medical_entities(self, transcript: str) -> List[MedicalEntity]:
         """Extract medical entities from transcript"""
@@ -1007,14 +1135,13 @@ class RealTimeMedicalProcessor:
             # Extract entities (fast operation)
             entities = await self._extract_medical_entities_fast(transcript)
             if entities:
+                # STORE entities for progressive SOAP building
+                patient_context.extracted_entities.extend(entities)
                 self._update_patient_context(patient_context, entities)
                 
                 yield RealtimeResult(
                     type="entities",
-                    data={
-                        "entities": [entity.dict() for entity in entities],
-                        "new_entities": len(entities)
-                    },
+                    data={"entities": [entity.dict() for entity in entities]},
                     session_id=patient_context.session_id,
                     is_partial=not is_final
                 )
@@ -1080,8 +1207,7 @@ class RealTimeMedicalProcessor:
                 logger.info(f"📄 Generating final results from {transcript_count} transcripts ({total_chars} chars)")
                 
                 full_transcript = " ".join(patient_context.conversation_history)
-                async for result in self._generate_final_results(patient_context, full_transcript):
-                    yield result
+                print("full_transcript", full_transcript)
             else:
                 logger.warning("❌ No conversation history for final processing")
                 yield RealtimeResult(
@@ -1141,67 +1267,167 @@ class RealTimeMedicalProcessor:
             return ""
     
     async def _process_audio_buffer(self, patient_context: PatientContext, 
-                              is_final: bool) -> AsyncGenerator[RealtimeResult, None]:
-        """Process audio buffer with better final handling"""
+                          is_final: bool) -> AsyncGenerator[RealtimeResult, None]:
+        """Process audio buffer with progressive SOAP building - DeepScribe style"""
         try:
             # Convert buffer to WAV format
             wav_data = self.audio_processor.create_wav_from_buffer(patient_context.audio_buffer)
             if not wav_data or len(wav_data) < 1000:
                 if is_final:
-                    # Even with small/no audio, try to generate final results if we have transcripts
-                    if patient_context.conversation_history:
-                        full_transcript = " ".join(patient_context.conversation_history)
-                        async for result in self._generate_final_results(patient_context, full_transcript):
-                            yield result
+                    # Even with small audio, send current SOAP state immediately
+                    current_soap
+                    final_soap = self._format_current_soap(patient_context.soap_note_sections)
+                    yield RealtimeResult(
+                        type="soap_note_complete",
+                        data={
+                            "content": final_soap,
+                            "is_complete": True,
+                            "is_progressive": True,
+                            "session_duration": time.time() - patient_context.start_time
+                        },
+                        session_id=patient_context.session_id,
+                        is_partial=False
+                    )
                 return
             
-            # Transcribe
+            # Transcribe audio
             transcript = await self._transcribe_audio(wav_data)
-            if transcript and transcript.strip():
-                logger.info(f"Processing: '{transcript[:100]}...'")
+            if not transcript or not transcript.strip():
+                if is_final:
+                    # Send current SOAP state even if no new transcript
+                    final_soap = self._format_current_soap(patient_context.soap_note_sections)
+                    yield RealtimeResult(
+                        type="soap_note_complete",
+                        data={
+                            "content": final_soap,
+                            "is_complete": True,
+                            "is_progressive": True,
+                            "session_duration": time.time() - patient_context.start_time
+                        },
+                        session_id=patient_context.session_id,
+                        is_partial=False
+                    )
+                return
+            
+            # Check for duplicate transcript
+            if self._is_duplicate_transcript(patient_context, transcript):
+                logger.debug("Duplicate transcript, skipping processing")
+                if is_final:
+                    # Still send final SOAP on duplicate if this is final
+                    final_soap = self._format_current_soap(patient_context.soap_note_sections)
+                    yield RealtimeResult(
+                        type="soap_note_complete",
+                        data={
+                            "content": final_soap,
+                            "is_complete": True,
+                            "is_progressive": True,
+                            "session_duration": time.time() - patient_context.start_time
+                        },
+                        session_id=patient_context.session_id,
+                        is_partial=False
+                    )
+                return
+            
+            logger.info(f"Processing: '{transcript[:50]}...'")
+            
+            # Update conversation history
+            patient_context.conversation_history.append(transcript)
+            
+            # Yield transcript immediately
+            yield RealtimeResult(
+                type="transcript",
+                data={
+                    "text": transcript,
+                    "full_transcript": " ".join(patient_context.conversation_history),
+                    "is_partial": not is_final
+                },
+                session_id=patient_context.session_id,
+                is_partial=not is_final
+            )
+            
+            # Extract entities (fast operation)
+            entities = await self._extract_medical_entities_fast(transcript)
+            if entities:
+                self._update_patient_context(patient_context, entities)
                 
-                # Update conversation history
-                patient_context.conversation_history.append(transcript)
-                
-                # Yield transcript result
                 yield RealtimeResult(
-                    type="transcript",
+                    type="entities",
                     data={
-                        "text": transcript,
-                        "full_transcript": " ".join(patient_context.conversation_history),
-                        "is_partial": not is_final
+                        "entities": [entity.dict() for entity in entities],
+                        "new_entities": len(entities)
                     },
                     session_id=patient_context.session_id,
                     is_partial=not is_final
                 )
-                
-                # Extract entities
-                entities = await self._extract_medical_entities(transcript)
-                if entities:
-                    self._update_patient_context(patient_context, entities)
-                    
-                    yield RealtimeResult(
-                        type="entities",
-                        data={
-                            "entities": [entity.dict() for entity in entities],
-                            "new_entities": len(entities)
-                        },
-                        session_id=patient_context.session_id,
-                        is_partial=not is_final
-                    )
             
-            # If this is final processing, generate results immediately
+            # DEEPSCRIBE STRATEGY: Progressive SOAP building
+            current_soap = await self._update_progressive_soap(patient_context, transcript, entities)
+            
+            if current_soap:
+                yield RealtimeResult(
+                    type="soap_update", 
+                    data={
+                        "current_sections": patient_context.soap_note_sections,
+                        "soap_note": current_soap,
+                        "is_progressive": True,
+                        "new_content": transcript[:100] + "..." if len(transcript) > 100 else transcript
+                    },
+                    session_id=patient_context.session_id,
+                    is_partial=not is_final
+                )
+            
+            # DEEPSCRIBE STRATEGY: If this is final processing, send SOAP immediately
             if is_final:
-                full_transcript = " ".join(patient_context.conversation_history)
-                if full_transcript.strip():
-                    logger.info(f"Starting final SOAP generation for {len(full_transcript)} chars")
-                    async for result in self._generate_final_results(patient_context, full_transcript):
-                        yield result
-                else:
-                    logger.warning("No transcript content for final SOAP generation")
+                # Use the CURRENT_SOAP that was just generated by rule-based generator, not the basic sections
+                final_soap = current_soap  # ← USE THIS instead of _format_current_soap
+                
+                # PRINT TO SERVER CONSOLE FOR DEBUGGING
+                print(f"\n" + "="*80)
+                print("🎉 FINAL SOAP NOTE - PROGRESSIVE BUILD (DeepScribe Strategy):")
+                print("="*80)
+                print(final_soap)  # This will now show the actual SOAP content
+                print("="*80)
+                print(f"📊 Stats: {len(final_soap)} chars, {len(patient_context.conversation_history)} transcripts")
+                print(f"⏱️  Session duration: {time.time() - patient_context.start_time:.2f}s")
+                print("="*80 + "\n")
+                
+                yield RealtimeResult(
+                    type="soap_note_complete",
+                    data={
+                        "content": final_soap,  # Send the actual SOAP content
+                        "is_complete": True,
+                        "is_progressive": True,
+                        "session_duration": time.time() - patient_context.start_time,
+                        "transcript_count": len(patient_context.conversation_history),
+                        "entities_count": len(patient_context.extracted_entities)
+                    },
+                    session_id=patient_context.session_id,
+                    is_partial=False
+                )
+                logger.info(f"✅ Final SOAP note sent immediately - WebSocket ready to close")
                             
         except Exception as e:
             logger.error(f"Audio buffer processing error: {e}")
+            
+            # Even on error, try to send current SOAP state if this is final
+            if is_final:
+                try:
+                    final_soap = self._format_current_soap(patient_context.soap_note_sections)
+                    yield RealtimeResult(
+                        type="soap_note_complete",
+                        data={
+                            "content": final_soap,
+                            "is_complete": True,
+                            "is_progressive": True,
+                            "session_duration": time.time() - patient_context.start_time,
+                            "error_note": f"Completed with processing error: {str(e)}"
+                        },
+                        session_id=patient_context.session_id,
+                        is_partial=False
+                    )
+                except Exception as final_error:
+                    logger.error(f"Even final SOAP sending failed: {final_error}")
+            
             yield RealtimeResult(
                 type="error",
                 data={"message": f"Processing error: {str(e)}"},
@@ -1641,141 +1867,6 @@ async def websocket_realtime_audio(websocket: WebSocket):
     finally:
         logger.info(f"🔚 WebSocket session ended: {session_id}")
 
-async def process_realtime_stream(self, session_id: str, 
-                               audio_stream: AsyncGenerator[bytes, None]) -> AsyncGenerator[RealtimeResult, None]:
-    """
-    Ensure final processing completes quickly
-    """
-    logger.info(f"🚀 STARTING processing for session: {session_id}")
-    
-    patient_context = PatientContext(session_id=session_id)
-    
-    with self.session_lock:
-        self.active_sessions[session_id] = patient_context
-    
-    try:
-        buffer_count = 0
-        
-        async for audio_chunk in audio_stream:
-            buffer_count += 1
-            self.audio_processor.add_audio_to_buffer(patient_context.audio_buffer, audio_chunk)
-            
-            # Process every 50 chunks to avoid backlog
-            if buffer_count % 50 == 0:
-                logger.info(f"🔄 Processing chunk {buffer_count}, buffer size: {len(patient_context.audio_buffer)}")
-                async for result in self._process_audio_buffer(patient_context, is_final=False):
-                    yield result
-                # Clear buffer after processing to prevent duplicates
-                patient_context.audio_buffer.clear()
-        
-        # CRITICAL FIX: The stream has ended - process final buffer immediately
-        logger.info(f"🎬 STREAM ENDED for {session_id}. Buffer count: {buffer_count}, Final buffer size: {len(patient_context.audio_buffer)}")
-        
-        if patient_context.audio_buffer:
-            logger.info(f"📦 Processing final buffer ({len(patient_context.audio_buffer)} bytes)")
-            async for result in self._process_audio_buffer(patient_context, is_final=True):
-                yield result
-            patient_context.audio_buffer.clear()
-        else:
-            logger.info("📦 No final buffer to process")
-        
-        # Force final results regardless of buffer - USE FAST VERSION
-        if patient_context.conversation_history:
-            transcript_count = len(patient_context.conversation_history)
-            total_chars = sum(len(t) for t in patient_context.conversation_history)
-            logger.info(f"📄 Generating FAST final results from {transcript_count} transcripts ({total_chars} chars)")
-            
-            full_transcript = " ".join(patient_context.conversation_history)
-            async for result in self._generate_final_results_fast(patient_context, full_transcript):
-                yield result
-        else:
-            logger.warning("❌ No conversation history for final processing")
-            yield RealtimeResult(
-                type="error",
-                data={"message": "No audio was transcribed successfully"},
-                session_id=session_id,
-                is_partial=False
-            )
-                
-    except Exception as e:
-        logger.error(f"💥 Stream processing error: {e}", exc_info=True)
-        yield RealtimeResult(
-            type="error",
-            data={"message": f"Processing error: {str(e)}"},
-            session_id=session_id,
-            is_partial=False
-        )
-    finally:
-        with self.session_lock:
-            if session_id in self.active_sessions:
-                del self.active_sessions[session_id]
-        logger.info(f"🧹 Cleaned up session: {session_id}")
-
-async def process_realtime_stream(self, session_id: str, 
-                               audio_stream: AsyncGenerator[bytes, None]) -> AsyncGenerator[RealtimeResult, None]:
-    """
-    Ensure final processing completes
-    """
-    print(f"🚀 DEBUG: process_realtime_stream STARTED for {session_id}")
-    logger.info(f"Starting processing for session: {session_id}")
-    
-    # Initialize patient context
-    patient_context = PatientContext(session_id=session_id)
-    
-    with self.session_lock:
-        self.active_sessions[session_id] = patient_context
-    
-    try:
-        # Process audio stream
-        async for audio_chunk in audio_stream:
-            # Add to buffer
-            self.audio_processor.add_audio_to_buffer(patient_context.audio_buffer, audio_chunk)
-            
-            # Process if we have enough audio
-            if await self._should_process_buffer(patient_context.audio_buffer):
-                async for result in self._process_audio_buffer(patient_context, is_final=False):
-                    yield result
-        
-        # CRITICAL: Ensure final processing happens
-        logger.info(f"Audio stream ended, starting final processing for {session_id}")
-        
-        # Process remaining audio with is_final=True
-        if patient_context.audio_buffer:
-            logger.info(f"Final buffer size: {len(patient_context.audio_buffer)} bytes")
-            async for result in self._process_audio_buffer(patient_context, is_final=True):
-                yield result
-        
-        # Force final SOAP note generation even if no new audio
-        if patient_context.conversation_history:
-            logger.info(f"Generating final SOAP note from {len(patient_context.conversation_history)} transcripts")
-            full_transcript = " ".join(patient_context.conversation_history)
-            print("🎯 DEBUG: ABOUT TO CALL _generate_final_results!")
-            print(f"🎯 DEBUG: Conversation history count: {len(patient_context.conversation_history)}")
-            async for result in self._generate_final_results(patient_context, full_transcript):
-                yield result
-        else:
-            logger.warning(f"No conversation history for final processing in session {session_id}")
-            yield RealtimeResult(
-                type="error",
-                data={"message": "No audio was processed successfully"},
-                session_id=session_id,
-                is_partial=False
-            )
-                
-    except Exception as e:
-        logger.error(f"Real-time stream processing error: {e}")
-        yield RealtimeResult(
-            type="error",
-            data={"message": f"Stream processing error: {str(e)}"},
-            session_id=session_id,
-            is_partial=False
-        )
-    finally:
-        # Cleanup
-        with self.session_lock:
-            if session_id in self.active_sessions:
-                del self.active_sessions[session_id]
-        logger.info(f"Session cleanup completed for {session_id}")
 
 def _convert_realtime_result_to_response(realtime_result: RealtimeResult) -> dict:
     """Convert RealTimeMedicalProcessor result to client response format"""
@@ -1870,44 +1961,7 @@ async def end_stream(request: EndStreamRequest):
             soap_note="",
             session_duration=0
         )
-    
-@app.post("/debug-process-audio")
-async def debug_process_audio(file_path: str = "doctor_patient_conversation.wav"):
-    """Debug endpoint to test the processing pipeline directly"""
-    try:
-        # Read the audio file
-        with open(file_path, 'rb') as f:
-            audio_data = f.read()
-        
-        # Create a simple audio stream
-        async def test_audio_stream():
-            chunk_size = 4096
-            for i in range(0, len(audio_data), chunk_size):
-                yield audio_data[i:i + chunk_size]
-        
-        # Process directly
-        session_id = f"debug_{int(time.time())}"
-        results = []
-        
-        async for result in REALTIME_PROCESSOR.process_realtime_stream(session_id, test_audio_stream()):
-            results.append(result)
-            logger.info(f"DEBUG RESULT: {result.type} - {result.data.get('text', '')[:50] if result.type == 'transcript' else ''}")
-        
-        # Return all results
-        return {
-            "session_id": session_id,
-            "results": [
-                {
-                    "type": r.type,
-                    "data": r.data,
-                    "is_partial": r.is_partial
-                } for r in results
-            ]
-        }
-        
-    except Exception as e:
-        logger.error(f"Debug processing error: {e}", exc_info=True)
-        return {"error": str(e)}
+
 @app.get("/health")
 async def health():
     return {
