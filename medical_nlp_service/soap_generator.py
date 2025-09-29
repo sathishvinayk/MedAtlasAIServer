@@ -1,10 +1,10 @@
 from utils import normalize_medication_name
-from typing import List
+from typing import List, Dict
 from shared_models import MedicalEntity
 import re
 
-def generate_soap_note_rule_based(transcript: str, entities: List[MedicalEntity]) -> str:
-    """Enhanced rule-based SOAP note using actual conversation context"""
+def generate_soap_note_rule_based(transcript: str, entities: List[MedicalEntity]) -> Dict[str, str]:
+    """Enhanced rule-based SOAP note returning structured data"""
     symptoms = sorted(set(e.text for e in entities if e.entity == "SYMPTOM"))
     
     # Enhanced medication normalization
@@ -17,7 +17,7 @@ def generate_soap_note_rule_based(transcript: str, entities: List[MedicalEntity]
     
     transcript_lower = transcript.lower()
     
-    # Extract blood pressure readings
+    # Extract blood pressure readings (your existing logic)
     bp_readings = []
     bp_pattern = r'blood pressure.*?(\d+)\s*over\s*(\d+)|(\d+)\s*\/\s*(\d+)'
     for match in re.finditer(bp_pattern, transcript_lower):
@@ -26,18 +26,25 @@ def generate_soap_note_rule_based(transcript: str, entities: List[MedicalEntity]
         elif match.group(3) and match.group(4):
             bp_readings.append(f"{match.group(3)}/{match.group(4)}")
     
-    # Enhanced clinical context
+    # Enhanced clinical context (your existing logic)
     has_hypertension = any(term in transcript_lower for term in ['blood pressure', 'hypertension', 'htn'])
     switching_medication = any(term in transcript_lower for term in ['switch', 'change medication', 'new medication'])
     ace_inhibitor_cough = 'ace inhibitor' in transcript_lower and 'cough' in symptoms
     
-    # Build professional SOAP note
+    # Build professional SOAP sections
     subjective = build_subjective_section(transcript, symptoms, medications, transcript_lower)
     objective = build_objective_section(bp_readings, medications, transcript_lower)
     assessment = build_assessment_section(symptoms, medications, transcript_lower, ace_inhibitor_cough)
     plan = build_plan_section(symptoms, medications, transcript_lower, switching_medication)
     
-    return f"{subjective}\n\n{objective}\n\n{assessment}\n\n{plan}"
+    # Return structured data instead of formatted text
+    return {
+        "subjective": subjective,  # Just the content: "- Patient presents for..."
+        "objective": objective,    # Just the content: "- Blood Pressure: 8/82 mmHg"
+        "assessment": assessment,  # Just the content: "- 1. Essential hypertension"
+        "plan": plan,              # Just the content: "- Discontinue current ACE inhibitor..."
+        "full_note": f"SUBJECTIVE:\n{subjective}\n\nOBJECTIVE:\n{objective}\n\nASSESSMENT:\n{assessment}\n\nPLAN:\n{plan}"
+    }
 
 def build_subjective_section(transcript: str, symptoms: list, medications: list, transcript_lower: str) -> str:
     """Build professional SUBJECTIVE section"""
@@ -83,7 +90,7 @@ def build_subjective_section(transcript: str, symptoms: list, medications: list,
         normalized_meds = [normalize_medication_name(med)[0] for med in medications]
         parts.append(f"Current medications: {', '.join(normalized_meds)}")
     
-    return "SUBJECTIVE:\n" + "\n".join(f"- {part}" for part in parts)
+    return "\n".join(f"- {part}" for part in parts)  # ← NO HEADER
 
 def build_objective_section(bp_readings: list, medications: list, transcript_lower: str) -> str:
     """Build professional OBJECTIVE section"""
@@ -109,7 +116,7 @@ def build_objective_section(bp_readings: list, medications: list, transcript_low
     
     parts.append("Physical Examination: " + "; ".join(exam_parts))
     
-    return "OBJECTIVE:\n" + "\n".join(f"- {part}" for part in parts)
+    return "\n".join(f"- {part}" for part in parts)
 
 def build_assessment_section(symptoms: list, medications: list, transcript_lower: str, ace_inhibitor_cough: bool) -> str:
     """Build professional ASSESSMENT section"""
@@ -133,7 +140,11 @@ def build_assessment_section(symptoms: list, medications: list, transcript_lower
         if symptom.lower() in symptom_assessments:
             parts.append(symptom_assessments[symptom.lower()])
     
-    return "ASSESSMENT:\n" + "\n".join(f"- {part}" for part in parts)
+    # FIX: Return empty string if no content, not a newline
+    if not parts:
+        return ""
+    
+    return "\n".join(f"- {part}" for part in parts)
 
 def build_plan_section(symptoms: list, medications: list, transcript_lower: str, switching_medication: bool) -> str:
     """Build professional PLAN section"""
@@ -156,5 +167,9 @@ def build_plan_section(symptoms: list, medications: list, transcript_lower: str,
     parts.append("Patient education provided on medication adherence and side effect monitoring")
     parts.append("Instructed to report any worsening symptoms or new adverse effects")
     parts.append("Encouraged to maintain blood pressure log")
+
+    # FIX: Return empty string if no content, not a newline
+    if not parts:
+        return ""
     
-    return "PLAN:\n" + "\n".join(f"- {part}" for part in parts)
+    return "\n".join(f"- {part}" for part in parts)

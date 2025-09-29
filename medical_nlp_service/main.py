@@ -984,36 +984,43 @@ class RealTimeMedicalProcessor:
         logger.info("Optimized RealTimeMedicalProcessor initialized")
     
     def _format_current_soap(self, sections: Dict[str, str]) -> str:
-        """Format the current SOAP state for sending to client"""
+        """Format the current SOAP state and remove empty lines"""
         soap_note = ""
         for section, content in sections.items():
             if content.strip():
-                soap_note += f"{section.upper()}:\n{content}\n\n"
+                # Remove leading/trailing whitespace and empty lines
+                clean_content = content.strip()
+                # Remove any leading empty lines
+                clean_content = '\n'.join(line for line in clean_content.split('\n') if line.strip())
+                
+                soap_note += f"{section.upper()}:\n{clean_content}\n\n"
         return soap_note.strip()
 
     async def _update_progressive_soap(self, patient_context: PatientContext, transcript: str, entities: List[MedicalEntity]):
-        """Update SOAP note progressively using the sophisticated rule-based generator"""
+        """Update SOAP note progressively using structured data"""
         
         # Combine all transcripts so far for context
         all_transcripts = " ".join(patient_context.conversation_history + [transcript])
-        
-        # Use ALL stored entities (no need to combine manually)
-        all_entities = patient_context.extracted_entities  # ← SIMPLIFIED
+        all_entities = patient_context.extracted_entities
         
         print(f"🔍 DEBUG: {len(patient_context.conversation_history)} transcripts, {len(entities)} new entities")
         print(f"🔍 DEBUG: Total stored entities: {len(all_entities)}")
         
-        # Use your sophisticated rule-based generator
-        current_soap = generate_soap_note_rule_based(all_transcripts, all_entities)
+        # Use your sophisticated rule-based generator (now returns dict)
+        soap_data = generate_soap_note_rule_based(all_transcripts, all_entities)
         
-        print(f"🔍 DEBUG: Generated SOAP length: {len(current_soap)}")
-        if current_soap:
-            print(f"🔍 DEBUG: SOAP preview: {current_soap[:200]}...")
+        print(f"🔍 DEBUG: Generated SOAP sections: {list(soap_data.keys())}")
+        print(f"🔍 DEBUG: SOAP preview: {soap_data['full_note'][:200]}...")
         
-        # Update patient context with current SOAP state
-        patient_context.soap_note_sections = self._parse_soap_to_sections(current_soap)
+        # Update patient context with structured sections
+        patient_context.soap_note_sections = {
+            "subjective": soap_data["subjective"],
+            "objective": soap_data["objective"],
+            "assessment": soap_data["assessment"], 
+            "plan": soap_data["plan"]
+        }
         
-        return current_soap
+        return soap_data["full_note"]  # Return formatted version for display
 
     def _parse_soap_to_sections(self, soap_note: str) -> Dict[str, str]:
         """Parse the rule-based SOAP note back into sections for progressive updates"""
@@ -1340,7 +1347,7 @@ class RealTimeMedicalProcessor:
                 yield RealtimeResult(
                     type="soap_update", 
                     data={
-                        "current_sections": patient_context.soap_note_sections,
+                        "current_sections": patient_context.soap_note_sections,  # Already structured!
                         "soap_note": current_soap,
                         "is_progressive": True,
                         "new_content": transcript[:100] + "..." if len(transcript) > 100 else transcript
