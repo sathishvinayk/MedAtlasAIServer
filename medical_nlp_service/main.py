@@ -845,6 +845,7 @@ class RealTimeMedicalValidator:
             "nsaids": ["peptic ulcer", "kidney disease"],
             "statins": ["liver disease", "pregnancy"]
         }
+    
     def _map_to_medication_class(self, medication: str) -> List[str]:
         """Map specific medications to their drug classes"""
         medication = medication.lower()
@@ -860,6 +861,56 @@ class RealTimeMedicalValidator:
             classes.append('statin')
         
         return classes
+
+    def check_ace_inhibitor_safety(self, medications: List[str], symptoms: List[str]) -> List[Dict[str, str]]:
+        """Specific safety checks for ACE inhibitors"""
+        alerts = []
+        
+        # Convert to lowercase for case-insensitive matching
+        meds_lower = [med.lower() for med in medications]
+        symptoms_lower = [symptom.lower() for symptom in symptoms]
+        
+        # Check if any ACE inhibitors are present
+        ace_medications = []
+        for med in medications:
+            med_lower = med.lower()
+            if any(ace in med_lower for ace in ['lisinopril', 'enalapril', 'ramipril', 'ace inhibitor', 'ace']):
+                ace_medications.append(med)
+        
+        if ace_medications:
+            # Check for ACE inhibitor cough
+            if 'cough' in symptoms_lower:
+                alerts.append({
+                    "type": "side_effect_alert",
+                    "message": f"ACE inhibitor ({', '.join(ace_medications)}) may be causing persistent cough",
+                    "severity": "moderate",
+                    "entities": ace_medications,
+                    "recommendation": "Consider switching to ARB if cough persists"
+                })
+            
+            # Check for hyperkalemia risk symptoms
+            hyperkalemia_symptoms = ['weakness', 'fatigue', 'palpitations', 'tired', 'dizziness']
+            if any(symptom in ' '.join(symptoms_lower) for symptom in hyperkalemia_symptoms):
+                alerts.append({
+                    "type": "safety_alert", 
+                    "message": f"ACE inhibitor use with these symptoms may indicate hyperkalemia",
+                    "severity": "high",
+                    "entities": ace_medications,
+                    "recommendation": "Check potassium levels and renal function"
+                })
+            
+            # Check for angioedema risk
+            angioedema_terms = ['swelling', 'swollen', 'angioedema', 'face swelling', 'lip swelling']
+            if any(term in ' '.join(symptoms_lower) for term in angioedema_terms):
+                alerts.append({
+                    "type": "safety_alert",
+                    "message": "Possible angioedema with ACE inhibitor use",
+                    "severity": "urgent",
+                    "entities": ace_medications,
+                    "recommendation": "Discontinue ACE inhibitor immediately and seek emergency care"
+                })
+        
+        return alerts
     
     def validate_medication_safety(self, medications: List[str]) -> List[Dict[str, str]]:
         """Check for dangerous medication combinations with class mapping"""
@@ -1372,6 +1423,13 @@ class RealTimeMedicalProcessor:
                     medication, patient_context.medical_history, patient_context.current_symptoms
                 )
                 alerts.extend(self._convert_to_realtime_results(medication_alerts, patient_context.session_id))
+            
+            # 🆕 ADD ACE INHIBITOR SPECIFIC CHECKS HERE
+            ace_alerts = validator.check_ace_inhibitor_safety(
+                patient_context.medications + new_medications,
+                patient_context.current_symptoms + new_symptoms
+            )
+            alerts.extend(self._convert_to_realtime_results(ace_alerts, patient_context.session_id))
         
         except Exception as e:
             logger.error(f"Medical validation error: {e}")
@@ -1399,6 +1457,13 @@ class RealTimeMedicalProcessor:
                 patient_context.medications, patient_context.medical_history
             )
             alerts.extend(self._convert_to_realtime_results(condition_alerts, patient_context.session_id))
+            
+            # 🆕 FINAL ACE INHIBITOR CHECK
+            ace_alerts = validator.check_ace_inhibitor_safety(
+                patient_context.medications,
+                patient_context.current_symptoms
+            )
+            alerts.extend(self._convert_to_realtime_results(ace_alerts, patient_context.session_id))
             
         except Exception as e:
             logger.error(f"Final validation error: {e}")
