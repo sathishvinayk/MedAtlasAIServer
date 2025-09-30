@@ -24,7 +24,6 @@ from transformers import (
 )
 import tempfile  # Make sure this is imported
 import os
-from dataclasses import dataclass, field
 from utils import normalize_medication_name, truncate_text, get_audio_duration, map_spacy_label_to_medical, universal_transcript, temp_audio_file, map_biobert_label_to_medical, align_transcription_with_speakers
 from soap_generator import generate_soap_note_rule_based
 from audio_models import ProcessAudioRequest, ProcessAudioResponse
@@ -33,6 +32,7 @@ from entity_extractor import extract_entities_keywords, deduplicate_entities, fi
 from constants import MEDICAL_KEYWORDS
 from config import WHISPER_MODEL_SIZE, MEDICAL_LLM_NAME, PYANNOTE_AUTH_TOKEN
 from audioStreamProcessor import AudioStreamProcessor
+from shared_models import RealtimeResult, PatientContext
 
 # from huggingface_hub import hf_hub_download
 # hf_hub_download(repo_id="emilyalsentzer/Bio_ClinicalBERT", filename="pytorch_model.bin", force_download=True)
@@ -702,32 +702,6 @@ async def process_audio(request: ProcessAudioRequest):
             error=f"Processing failed: {str(e)}",
             request_id=request_id
         )
-    
-@dataclass
-class PatientContext:
-    """Patient context maintained throughout the conversation"""
-    session_id: str
-    conversation_history: List[str] = field(default_factory=list)
-    current_symptoms: List[str] = field(default_factory=list)
-    medications: List[str] = field(default_factory=list)
-    medical_history: List[str] = field(default_factory=list)
-    soap_note_sections: Dict[str, str] = field(default_factory=lambda: {
-        "subjective": "", "objective": "", "assessment": "", "plan": ""
-    })
-    extracted_entities: List[MedicalEntity] = field(default_factory=list)
-    start_time: float = field(default_factory=time.time)
-    audio_buffer: bytearray = field(default_factory=bytearray)
-    last_activity: float = field(default_factory=time.time)
-
-@dataclass
-class RealtimeResult:
-    """Internal real-time processing result"""
-    type: str  # "transcript", "entities", "soap_update", "medical_alert"
-    data: Dict[str, Any]
-    session_id: str
-    is_partial: bool = True
-    timestamp: float = field(default_factory=time.time)
-    confidence: float = 0.9
 
 class MedicalConversationAnalyzer:
     """Analyzes clinical conversation patterns in real-time"""
@@ -1137,85 +1111,6 @@ class RealTimeMedicalProcessor:
         except Exception as e:
             logger.error(f"Entity extraction error: {e}")
             return []
-    
-    async def _process_audio_buffer_optimized(self, patient_context: PatientContext, 
-                                            is_final: bool) -> AsyncGenerator[RealtimeResult, None]:
-        """Optimized audio buffer processing"""
-        try:
-            # Convert buffer to WAV format
-            wav_data = self.audio_processor.create_wav_from_buffer(patient_context.audio_buffer)
-            if not wav_data or len(wav_data) < 1000:
-                return
-            
-            # Quick validation before processing
-            if not await self._is_valid_audio_data(wav_data):
-                logger.warning("Invalid audio data, skipping processing")
-                return
-            
-            # Transcribe with timeout
-            try:
-                transcript = await asyncio.wait_for(
-                    self._transcribe_audio(wav_data), 
-                    timeout=10.0  # 10 second timeout for transcription
-                )
-            except asyncio.TimeoutError:
-                logger.warning("Transcription timeout, skipping chunk")
-                return
-            
-            if not transcript or not transcript.strip():
-                return
-            
-            # Check if this is new content (not duplicate)
-            if self._is_duplicate_transcript(patient_context, transcript):
-                logger.debug("Duplicate transcript, skipping")
-                return
-            
-            logger.info(f"Processing transcript: '{transcript[:50]}...'")
-            
-            # Update conversation history
-            patient_context.conversation_history.append(transcript)
-            
-            # Yield transcript immediately
-            yield RealtimeResult(
-                type="transcript",
-                data={
-                    "text": transcript,
-                    "full_transcript": " ".join(patient_context.conversation_history),
-                    "is_partial": not is_final
-                },
-                session_id=patient_context.session_id,
-                is_partial=not is_final
-            )
-            
-            # Extract entities (fast operation)
-            entities = await self._extract_medical_entities_fast(transcript)
-            if entities:
-                # STORE entities for progressive SOAP building
-                patient_context.extracted_entities.extend(entities)
-                self._update_patient_context(patient_context, entities)
-                
-                yield RealtimeResult(
-                    type="entities",
-                    data={"entities": [entity.dict() for entity in entities]},
-                    session_id=patient_context.session_id,
-                    is_partial=not is_final
-                )
-            
-            # Final processing
-            if is_final:
-                full_transcript = " ".join(patient_context.conversation_history)
-                if full_transcript.strip():
-                    async for result in self._generate_final_results_fast(patient_context, full_transcript):
-                        yield result
-                        
-        except Exception as e:
-            logger.error(f"Audio buffer processing error: {e}")
-            yield RealtimeResult(
-                type="error",
-                data={"message": f"Processing error: {str(e)}"},
-                session_id=patient_context.session_id,
-                is_partial=not is_final
-            )
     
     async def process_realtime_stream(self, session_id: str, 
                                audio_stream: AsyncGenerator[bytes, None]) -> AsyncGenerator[RealtimeResult, None]:
