@@ -820,12 +820,17 @@ class RealTimeMedicalValidator:
     def __init__(self):
         self.dangerous_combinations = [
             ("warfarin", "aspirin"),
-            ("lisinopril", "ibuprofen"),
+            ("lisinopril", "ibuprofen"), 
+            ("lisinopril", "naproxen"),  # Add more NSAIDs
+            ("ace_inhibitor", "nsaid"),   # Class-level interactions
             ("metformin", "alcohol"),
             ("simvastatin", "grapefruit"),
             ("digoxin", "furosemide"),
             ("levothyroxine", "calcium"),
-            ("phenytoin", "warfarin")
+            ("phenytoin", "warfarin"),
+            # Add ACE inhibitor specific interactions
+            ("ace_inhibitor", "potassium_sparing_diuretics"),
+            ("ace_inhibitor", "lithium")
         ]
         
         self.red_flag_symptoms = [
@@ -840,12 +845,28 @@ class RealTimeMedicalValidator:
             "nsaids": ["peptic ulcer", "kidney disease"],
             "statins": ["liver disease", "pregnancy"]
         }
+    def _map_to_medication_class(self, medication: str) -> List[str]:
+        """Map specific medications to their drug classes"""
+        medication = medication.lower()
+        classes = []
+        
+        if any(ace in medication for ace in ['lisinopril', 'enalapril', 'ramipril', 'ace inhibitor']):
+            classes.append('ace_inhibitor')
+        if any(arb in medication for arb in ['losartan', 'valsartan', 'arb']):
+            classes.append('arb')
+        if any(nsaid in medication for nsaid in ['ibuprofen', 'naproxen', 'nsaid']):
+            classes.append('nsaid')
+        if 'statin' in medication:
+            classes.append('statin')
+        
+        return classes
     
     def validate_medication_safety(self, medications: List[str]) -> List[Dict[str, str]]:
-        """Check for dangerous medication combinations"""
+        """Check for dangerous medication combinations with class mapping"""
         alerts = []
         meds_lower = [med.lower() for med in medications]
         
+        # Check exact medication matches
         for med1, med2 in self.dangerous_combinations:
             if med1 in meds_lower and med2 in meds_lower:
                 alerts.append({
@@ -854,6 +875,24 @@ class RealTimeMedicalValidator:
                     "severity": "high",
                     "entities": [med1, med2],
                     "recommendation": "Monitor closely or consider alternative medications"
+                })
+        
+        # Check medication class interactions
+        all_classes = []
+        for med in medications:
+            all_classes.extend(self._map_to_medication_class(med))
+        
+        for class1, class2 in self.dangerous_combinations:
+            if class1 in all_classes and class2 in all_classes:
+                involved_meds = [med for med in medications 
+                            if class1 in self._map_to_medication_class(med) or 
+                                class2 in self._map_to_medication_class(med)]
+                alerts.append({
+                    "type": "drug_interaction",
+                    "message": f"Potential class interaction between {class1} and {class2}",
+                    "severity": "moderate", 
+                    "entities": involved_meds,
+                    "recommendation": f"Monitor for {class1}-{class2} interactions"
                 })
         
         return alerts
