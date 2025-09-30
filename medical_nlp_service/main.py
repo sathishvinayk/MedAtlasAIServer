@@ -820,15 +820,26 @@ class RealTimeMedicalValidator:
     def __init__(self):
         self.dangerous_combinations = [
             ("warfarin", "aspirin"),
-            ("lisinperol", "ibuprofen"),
+            ("lisinopril", "ibuprofen"),
             ("metformin", "alcohol"),
-            ("simvastatin", "grapefruit")
+            ("simvastatin", "grapefruit"),
+            ("digoxin", "furosemide"),
+            ("levothyroxine", "calcium"),
+            ("phenytoin", "warfarin")
         ]
         
         self.red_flag_symptoms = [
             "chest pain", "shortness of breath", "severe headache",
-            "uncontrolled bleeding", "loss of consciousness"
+            "uncontrolled bleeding", "loss of consciousness",
+            "sudden weakness", "difficulty speaking", "severe abdominal pain"
         ]
+
+        self.contraindications = {
+            "beta_blockers": ["asthma", "copd"],
+            "ace_inhibitors": ["pregnancy", "angioedema"],
+            "nsaids": ["peptic ulcer", "kidney disease"],
+            "statins": ["liver disease", "pregnancy"]
+        }
     
     def validate_medication_safety(self, medications: List[str]) -> List[Dict[str, str]]:
         """Check for dangerous medication combinations"""
@@ -838,9 +849,11 @@ class RealTimeMedicalValidator:
         for med1, med2 in self.dangerous_combinations:
             if med1 in meds_lower and med2 in meds_lower:
                 alerts.append({
-                    "type": "medication_interaction",
-                    "message": f"Potential interaction between {med1} and {med2}",
-                    "severity": "high"
+                    "type": "drug_interaction",
+                    "message": f"Potential dangerous interaction between {med1} and {med2}",
+                    "severity": "high",
+                    "entities": [med1, med2],
+                    "recommendation": "Monitor closely or consider alternative medications"
                 })
         
         return alerts
@@ -853,10 +866,31 @@ class RealTimeMedicalValidator:
         for red_flag in self.red_flag_symptoms:
             if red_flag in transcript_lower:
                 alerts.append({
-                    "type": "red_flag_symptom",
+                    "type": "red_flag_symptom", 
                     "message": f"Red flag symptom detected: {red_flag}",
-                    "severity": "urgent"
+                    "severity": "urgent",
+                    "entities": [red_flag],
+                    "recommendation": "Requires immediate medical attention"
                 })
+        
+        return alerts
+
+    def check_contraindications(self, medication: str, conditions: List[str]) -> List[Dict[str, str]]:
+        """Check medication contraindications with patient conditions"""
+        alerts = []
+        med_lower = medication.lower()
+        
+        for med_class, contra_conditions in self.contraindications.items():
+            if med_class in med_lower:
+                for condition in conditions:
+                    if condition.lower() in contra_conditions:
+                        alerts.append({
+                            "type": "contraindication",
+                            "message": f"Medication {medication} may be contraindicated with {condition}",
+                            "severity": "high",
+                            "entities": [medication, condition],
+                            "recommendation": "Consult prescribing guidelines"
+                        })
         
         return alerts
 
@@ -1243,6 +1277,114 @@ class RealTimeMedicalProcessor:
         except Exception as e:
             logger.error(f"Transcription error: {e}")
             return ""
+        
+    def _check_medication_contraindications(self, medication: str, conditions: List[str], symptoms: List[str]) -> List[Dict]:
+        """Check individual medication against patient conditions and symptoms"""
+        alerts = []
+        validator = RealTimeMedicalValidator()
+        
+        # Check against medical conditions
+        condition_alerts = validator.check_contraindications(medication, conditions)
+        alerts.extend(condition_alerts)
+        
+        # Check against current symptoms
+        symptom_alerts = validator.check_contraindications(medication, symptoms)
+        alerts.extend(symptom_alerts)
+        
+        return alerts
+
+    def _check_condition_contraindications(self, medications: List[str], conditions: List[str]) -> List[Dict]:
+        """Check all medications against all conditions"""
+        alerts = []
+        validator = RealTimeMedicalValidator()
+        
+        for medication in medications:
+            condition_alerts = validator.check_contraindications(medication, conditions)
+            alerts.extend(condition_alerts)
+        
+        return alerts
+    
+    async def _perform_medical_validation(self, patient_context: PatientContext, 
+                                    new_entities: List[MedicalEntity], 
+                                    transcript: str) -> List[RealtimeResult]:
+        """Perform real-time medical safety validation"""
+        alerts = []
+        validator = RealTimeMedicalValidator()
+        
+        try:
+            # Extract medications from new entities
+            new_medications = [e.text for e in new_entities if e.entity == "MEDICATION"]
+            new_symptoms = [e.text for e in new_entities if e.entity == "SYMPTOM"]
+            
+            # 1. Check for dangerous medication combinations
+            if new_medications and patient_context.medications:
+                all_medications = patient_context.medications + new_medications
+                medication_alerts = validator.validate_medication_safety(all_medications)
+                alerts.extend(self._convert_to_realtime_results(medication_alerts, patient_context.session_id))
+            
+            # 2. Check for red flag symptoms
+            if new_symptoms:
+                symptom_alerts = validator.check_red_flags(new_symptoms, transcript)
+                alerts.extend(self._convert_to_realtime_results(symptom_alerts, patient_context.session_id))
+            
+            # 3. Check individual new medications against existing conditions
+            for medication in new_medications:
+                medication_alerts = self._check_medication_contraindications(
+                    medication, patient_context.medical_history, patient_context.current_symptoms
+                )
+                alerts.extend(self._convert_to_realtime_results(medication_alerts, patient_context.session_id))
+        
+        except Exception as e:
+            logger.error(f"Medical validation error: {e}")
+        
+        return alerts
+
+    async def _perform_final_validation(self, patient_context: PatientContext) -> List[RealtimeResult]:
+        """Perform comprehensive final validation"""
+        alerts = []
+        validator = RealTimeMedicalValidator()
+        
+        try:
+            # Final check for all accumulated medications
+            if patient_context.medications:
+                medication_alerts = validator.validate_medication_safety(patient_context.medications)
+                alerts.extend(self._convert_to_realtime_results(medication_alerts, patient_context.session_id))
+            
+            # Final check for red flags in entire conversation
+            full_transcript = " ".join(patient_context.conversation_history)
+            symptom_alerts = validator.check_red_flags(patient_context.current_symptoms, full_transcript)
+            alerts.extend(self._convert_to_realtime_results(symptom_alerts, patient_context.session_id))
+            
+            # Check for critical medication-condition interactions
+            condition_alerts = self._check_condition_contraindications(
+                patient_context.medications, patient_context.medical_history
+            )
+            alerts.extend(self._convert_to_realtime_results(condition_alerts, patient_context.session_id))
+            
+        except Exception as e:
+            logger.error(f"Final validation error: {e}")
+        
+        return alerts
+
+    def _convert_to_realtime_results(self, alerts: List[Dict], session_id: str) -> List[RealtimeResult]:
+        """Convert validator alerts to RealtimeResult objects"""
+        results = []
+        for alert in alerts:
+            results.append(RealtimeResult(
+                type="medical_alert",
+                data={
+                    "severity": alert.get("severity", "moderate"),
+                    "alert_type": alert.get("type", "safety_alert"),
+                    "message": alert.get("message", "Medical safety alert"),
+                    "entities_involved": alert.get("entities", []),
+                    "recommendation": alert.get("recommendation", "Please review"),
+                    "timestamp": time.time()
+                },
+                session_id=session_id,
+                is_partial=False,
+                confidence=0.9
+            ))
+        return results
     
     async def _process_audio_buffer(self, patient_context: PatientContext, 
                           is_final: bool) -> AsyncGenerator[RealtimeResult, None]:
@@ -1325,9 +1467,10 @@ class RealTimeMedicalProcessor:
             # Extract entities (fast operation)
             entities = await self._extract_medical_entities_fast(transcript)
             if entities:
-                # STORE ENTITIES CONSISTENTLY
-                patient_context.extracted_entities.extend(entities)  # ← ADD THIS
+                # STORE ENTITIES WITH DEDUPLICATION
+                patient_context.extracted_entities.extend(entities)
                 patient_context.extracted_entities = deduplicate_entities(patient_context.extracted_entities)
+                
                 self._update_patient_context(patient_context, entities)
                 
                 yield RealtimeResult(
@@ -1339,6 +1482,11 @@ class RealTimeMedicalProcessor:
                     session_id=patient_context.session_id,
                     is_partial=not is_final
                 )
+            
+            # 🚨 CRITICAL: PERFORM REAL-TIME MEDICAL VALIDATION
+            alerts = await self._perform_medical_validation(patient_context, entities, transcript)
+            for alert in alerts:
+                yield alert
             
             # DEEPSCRIBE STRATEGY: Progressive SOAP building
             current_soap = await self._update_progressive_soap(patient_context, transcript, entities)
@@ -1358,6 +1506,9 @@ class RealTimeMedicalProcessor:
             
             # DEEPSCRIBE STRATEGY: If this is final processing, send SOAP immediately
             if is_final:
+                final_alerts = await self._perform_final_validation(patient_context)
+                for alert in final_alerts:
+                    yield alert
                 # Use the CURRENT_SOAP that was just generated by rule-based generator, not the basic sections
                 final_soap = current_soap  # ← USE THIS instead of _format_current_soap
                 

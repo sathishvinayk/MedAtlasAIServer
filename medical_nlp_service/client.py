@@ -112,6 +112,25 @@ class SimpleDeepScribeClient:
                 print(soap_note)
                 print("=" * 60)
                 return "COMPLETE"
+            elif result_type == "medical_alert":
+                severity = result.get('severity', 'moderate')
+                message = result.get('message', '')
+                alert_type = result.get('alert_type', 'safety_alert')
+                
+                # Color code by severity
+                if severity == "urgent":
+                    icon = "🚨"
+                    color = "RED"
+                elif severity == "high":
+                    icon = "⚠️" 
+                    color = "YELLOW"
+                else:
+                    icon = "ℹ️"
+                    color = "BLUE"
+                
+                print(f"\n{icon} MEDICAL ALERT ({severity.upper()}): {message}")
+                print(f"   Type: {alert_type}")
+                print(f"   Recommendation: {result.get('recommendation', 'Please review')}")
                 
         except Exception as e:
             print(f"Error handling result: {e}")
