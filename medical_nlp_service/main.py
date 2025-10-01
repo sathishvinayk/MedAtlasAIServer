@@ -36,16 +36,51 @@ from shared_models import RealtimeResult, PatientContext
 from medical_conversation_analyzer import MedicalConversationAnalyzer
 from real_time_medical_validator import RealTimeMedicalValidator
 from progressive_soap_builder import ProgressiveSOAPBuilder
+from model_loader import (
+    load_models_async, 
+    cleanup_models,
+    get_models,
+    get_thread_pools,
+    get_model_status,
+    run_whisper_transcription,
+    run_biobert_ner,
+    run_spacy_processing,
+    run_llm_generation,
+    run_pyannote_diarization,
+    run_general_task,
+    WHISPER_MODEL,
+    BIOBERT_MODEL,
+    SPACY_MODEL,
+    MEDICAL_LLM,
+    MEDICAL_TOKENIZER,
+    PYANNOTE_PIPELINE
+)
 
 # from huggingface_hub import hf_hub_download
 # hf_hub_download(repo_id="emilyalsentzer/Bio_ClinicalBERT", filename="pytorch_model.bin", force_download=True)
 # hf_hub_download(repo_id="microsoft/BioGPT-Large", filename="pytorch_model.bin", force_download=True)
+
+# Initialize real-time processor after models are loaded
+async def initialize_realtime_processor():
+    """Initialize the real-time processor after models are loaded"""
+    global REALTIME_PROCESSOR
+
+    REALTIME_PROCESSOR = RealTimeMedicalProcessor(
+        whisper_model=WHISPER_MODEL,
+        medical_llm=MEDICAL_LLM,
+        pyannote_pipeline=PYANNOTE_PIPELINE,
+        biobert_model=BIOBERT_MODEL,
+        spacy_model=SPACY_MODEL
+    )
+    logger.info("Real-time medical processor initialized")
 
 # Lifespan management
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: load models
     await load_models_async()
+    await initialize_realtime_processor()
+
     yield
     # Shutdown: cleanup
     await cleanup_models()
@@ -75,96 +110,42 @@ logging.basicConfig(
 logger = logging.getLogger("medical-nlp-service")
 
 # Global models (loaded asynchronously)
-WHISPER_MODEL = None
-BIOBERT_MODEL = None
-SPACY_MODEL = None
-MEDICAL_LLM = None
-MEDICAL_TOKENIZER = None
-PYANNOTE_PIPELINE = None
 REALTIME_PROCESSOR = None
 
-# Thread pools for each model type
-MAX_WORKERS_BIOBERT = int(os.getenv('MAX_WORKERS_BIOBERT', '2'))
-MAX_WORKERS_SPACY = int(os.getenv('MAX_WORKERS_SPACY', '2'))
-MAX_WORKERS_WHISPER = int(os.getenv('MAX_WORKERS_WHISPER', '1'))
-MAX_WORKERS_SENTENCE = int(os.getenv('MAX_WORKERS_SENTENCE', '2'))
-MAX_WORKERS_GENERAL = int(os.getenv('MAX_WORKERS_GENERAL', '4'))
-MAX_WORKERS_LLM = int(os.getenv('MAX_WORKERS_LLM', '1'))  # LLM is memory-intensive
-MAX_WORKERS_PYANNOTE = int(os.getenv('MAX_WORKERS_PYANNOTE', '1'))
-
-WHISPER_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_WHISPER, thread_name_prefix="whisper_")
-BIOBERT_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_BIOBERT, thread_name_prefix="biobert_")
-SPACY_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_SPACY, thread_name_prefix="spacy_")
-GENERAL_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_GENERAL, thread_name_prefix="general_")
-LLM_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_LLM, thread_name_prefix="llm_")
-PYANNOTE_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS_PYANNOTE, thread_name_prefix="pyannote_")  # Add pyannote pool
-
-# Thread safety
-_biobert_lock = Lock()
-_spacy_lock = Lock()
-_llm_lock = Lock()
-_pyannote_lock = Lock()  # Add pyannote lock
-_model_load_lock = Lock()
-_models_loaded = False
 
 def perform_diarization(audio_path: str) -> List[SpeakerSegment]:
     """Perform speaker diarization using pyannote"""
-    global PYANNOTE_PIPELINE
     
     if PYANNOTE_PIPELINE is None:
         logger.warning("Pyannote pipeline not available, skipping diarization")
         return []
     
     try:
-        with _pyannote_lock:
-            # Apply the pipeline to the audio file
-            diarization = PYANNOTE_PIPELINE(audio_path)
-            
-            segments = []
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
-                segments.append(SpeakerSegment(
-                    speaker=speaker,
-                    start=round(turn.start, 2),
-                    end=round(turn.end, 2),
-                    text=""  # This will be filled with transcription later
-                ))
-            
-            logger.info(f"Diarization completed: {len(segments)} segments found")
-            return segments
+        # Apply the pipeline to the audio file
+        diarization = PYANNOTE_PIPELINE(audio_path)
+        
+        segments = []
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            segments.append(SpeakerSegment(
+                speaker=speaker,
+                start=round(turn.start, 2),
+                end=round(turn.end, 2),
+                text=""  # This will be filled with transcription later
+            ))
+        
+        logger.info(f"Diarization completed: {len(segments)} segments found")
+        return segments
             
     except Exception as e:
         logger.error(f"Pyannote diarization failed: {e}")
         return []
 
-# Load spaCy with EntityRuler (unchanged)
-def load_spacy_with_ruler():
-    try:
-        import spacy
-        from spacy.pipeline import EntityRuler
-        
-        nlp = spacy.load("en_core_web_sm")
-        
-        patterns = []
-        for label, keywords in MEDICAL_KEYWORDS.items():
-            for keyword in keywords:
-                patterns.append({"label": label, "pattern": [{"LOWER": keyword.lower()}]})
-        
-        ruler = nlp.add_pipe("entity_ruler", before="ner")
-        ruler.add_patterns(patterns)
-        
-        logger.info("✓ spaCy model with EntityRuler loaded successfully")
-        return nlp
-    except Exception as e:
-        logger.warning(f"spaCy with EntityRuler failed: {e}")
-        return None
 
 # Main entity extraction function (unchanged)
 def extract_medical_entities_sync(text: str) -> Tuple[List[MedicalEntity], str]:
     entities = []
     model_used = "keyword-fallback"
     
-    global BIOBERT_MODEL, SPACY_MODEL
-
     pattern_entities = extract_medical_patterns(text)
     change_entities = extract_medication_changes(text)
     entities.extend(pattern_entities)
@@ -174,8 +155,7 @@ def extract_medical_entities_sync(text: str) -> Tuple[List[MedicalEntity], str]:
     # PRIMARY: spaCy with enhanced patterns (SWITCHED TO PRIMARY)
     if SPACY_MODEL is not None:
         try:
-            with _spacy_lock:
-                doc = SPACY_MODEL(text)
+            doc = SPACY_MODEL(text)
             
             for ent in doc.ents:
                 entity_type = map_spacy_label_to_medical(ent.label_)
@@ -205,8 +185,7 @@ def extract_medical_entities_sync(text: str) -> Tuple[List[MedicalEntity], str]:
     # SECONDARY: BioBERT with lower confidence threshold (DEMOTED TO SECONDARY)
     if BIOBERT_MODEL is not None:
         try:
-            with _biobert_lock:
-                results = BIOBERT_MODEL(text)
+            results = BIOBERT_MODEL(text)
             
             logger.info(f"BioBERT raw results: {len(results)} entities found")
             
@@ -254,84 +233,81 @@ def extract_medical_entities_sync(text: str) -> Tuple[List[MedicalEntity], str]:
 
 # NEW: LLM-based SOAP note generation
 def generate_soap_note_llm(transcript: str, entities: List[MedicalEntity]) -> str:
-    """Generate SOAP note using fine-tuned medical LLM"""
-    global MEDICAL_LLM, MEDICAL_TOKENIZER
-    
+    """Generate SOAP note using fine-tuned medical LLM"""    
     if MEDICAL_LLM is None or MEDICAL_TOKENIZER is None:
         logger.warning("Medical LLM not available, falling back to rule-based SOAP")
         return generate_soap_note_rule_based(transcript, entities)
     
     try:
-        with _llm_lock:
-            # Prepare context from extracted entities
-            symptoms = sorted(set(e.text for e in entities if e.entity == "SYMPTOM"))
-            medications = sorted(set(
-                normalize_medication_name(e.text)[0]
-                for e in entities if e.entity == "MEDICATION"
-            ))
-            
-            # Construct prompt for medical LLM
-            prompt = f"""<s>[INST] <<SYS>>
-                You are a medical assistant trained to generate comprehensive SOAP notes from patient transcripts.
-                Generate a structured SOAP note following this format:
+        # Prepare context from extracted entities
+        symptoms = sorted(set(e.text for e in entities if e.entity == "SYMPTOM"))
+        medications = sorted(set(
+            normalize_medication_name(e.text)[0]
+            for e in entities if e.entity == "MEDICATION"
+        ))
+        
+        # Construct prompt for medical LLM
+        prompt = f"""<s>[INST] <<SYS>>
+            You are a medical assistant trained to generate comprehensive SOAP notes from patient transcripts.
+            Generate a structured SOAP note following this format:
 
-                SUBJECTIVE:
-                - Patient's reported symptoms and concerns
-                - Relevant medical history from conversation
+            SUBJECTIVE:
+            - Patient's reported symptoms and concerns
+            - Relevant medical history from conversation
 
-                OBJECTIVE:
-                - Vital signs and physical exam findings (infer from context)
-                - Current medications mentioned
+            OBJECTIVE:
+            - Vital signs and physical exam findings (infer from context)
+            - Current medications mentioned
 
-                ASSESSMENT:
-                - Clinical assessment and differential diagnosis
-                - Connection between symptoms and medications
+            ASSESSMENT:
+            - Clinical assessment and differential diagnosis
+            - Connection between symptoms and medications
 
-                PLAN:
-                - Treatment recommendations
-                - Follow-up instructions
-                - Medication adjustments if needed
+            PLAN:
+            - Treatment recommendations
+            - Follow-up instructions
+            - Medication adjustments if needed
 
-                Keep the note professional, concise, and clinically accurate.
-                <</SYS>>
+            Keep the note professional, concise, and clinically accurate.
+            <</SYS>>
 
-                Patient Transcript: "{truncate_text(transcript, 1500)}"
+            Patient Transcript: "{truncate_text(transcript, 1500)}"
 
-                Extracted Medical Information:
-                - Symptoms: {', '.join(symptoms) if symptoms else 'None reported'}
-                - Medications: {', '.join(medications) if medications else 'None reported'}
+            Extracted Medical Information:
+            - Symptoms: {', '.join(symptoms) if symptoms else 'None reported'}
+            - Medications: {', '.join(medications) if medications else 'None reported'}
 
-                Please generate a comprehensive SOAP note based on this information. [/INST]"""
-            
-            # Tokenize and generate
-            inputs = MEDICAL_TOKENIZER(prompt, return_tensors="pt", truncation=True, max_length=2048)
-            
-            # FIX: Move inputs to the same device as the model
-            device = next(MEDICAL_LLM.parameters()).device
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            
-            # Generate response
-            with torch.no_grad():
-                outputs = MEDICAL_LLM.generate(
-                    **inputs,
-                    max_new_tokens=512,
-                    temperature=0.7,
-                    do_sample=True,
-                    top_p=0.9,
-                    pad_token_id=MEDICAL_TOKENIZER.eos_token_id,
-                    repetition_penalty=1.1
-                )
-            
-            # Decode and extract the generated text
-            generated_text = MEDICAL_TOKENIZER.decode(outputs[0], skip_special_tokens=True)
-            
-            # Extract only the assistant's response (after the instruction)
-            response = generated_text.split("[/INST]")[-1].strip()
-            
-            # Clean up any remaining special tokens
-            response = re.sub(r'<s>|</s>|\[INST\]|\[/INST\]', '', response).strip()
-            
-            return response
+            Please generate a comprehensive SOAP note based on this information. [/INST]"""
+        
+        # Tokenize and generate
+        inputs = MEDICAL_TOKENIZER(prompt, return_tensors="pt", truncation=True, max_length=2048)
+        
+        # FIX: Move inputs to the same device as the model
+        device = next(MEDICAL_LLM.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        # Generate response
+        with torch.no_grad():
+            outputs = MEDICAL_LLM.generate(
+                **inputs,
+                max_new_tokens=512,
+                temperature=0.7,
+                do_sample=True,
+                top_p=0.9,
+                pad_token_id=MEDICAL_TOKENIZER.eos_token_id,
+                repetition_penalty=1.1
+            )
+        
+        # Decode and extract the generated text
+        generated_text = MEDICAL_TOKENIZER.decode(outputs[0], skip_special_tokens=True)
+        
+        # Extract only the assistant's response (after the instruction)
+        response = generated_text.split("[/INST]")[-1].strip()
+        
+        # Clean up any remaining special tokens
+        response = re.sub(r'<s>|</s>|\[INST\]|\[/INST\]', '', response).strip()
+        
+        return response
             
     except Exception as e:
         logger.error(f"LLM SOAP generation failed: {e}")
@@ -552,14 +528,7 @@ async def load_models_async():
         _models_loaded = True
         logger.info("Model loading completed")
 
-        # Initialize real-time processor AFTER models are loaded
-        REALTIME_PROCESSOR = RealTimeMedicalProcessor(
-            whisper_model=WHISPER_MODEL,
-            medical_llm=MEDICAL_LLM,
-            pyannote_pipeline=PYANNOTE_PIPELINE,
-            biobert_model=BIOBERT_MODEL,
-            spacy_model=SPACY_MODEL
-        )
+        
         logger.info("Real-time medical processor initialized")
 
 async def cleanup_models():
