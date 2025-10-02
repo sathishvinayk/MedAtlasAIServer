@@ -16,6 +16,25 @@ class SimpleDeepScribeClient:
         self.websocket = None
         self.is_connected = False
     
+    async def _listen_for_results(self):
+        """Enhanced listener with timeout reset on any message"""
+        last_message_time = time.time()
+        timeout = 60.0  # Windows timeout threshold
+        
+        try:
+            async for message in self.websocket:
+                last_message_time = time.time()  # Reset timeout on ANY message
+                status = await self._handle_result(message)
+                if status in ["COMPLETE", "ERROR"]:
+                    break
+                    
+                # Check if we're approaching timeout
+                if time.time() - last_message_time > timeout - 5:  # 5 seconds before timeout
+                    print("⚠️  No recent messages - connection may timeout")
+                    
+        except Exception as e:
+            print(f"❌ Result listening error: {e}")
+    
     async def connect(self):
         """Connect to WebSocket server"""
         try:
@@ -44,6 +63,9 @@ class SimpleDeepScribeClient:
             # Start listening for results
             listener_task = asyncio.create_task(self._listen_for_results())
             
+            if sys.platform == "win32":
+                ping_task = asyncio.create_task(self._send_periodic_pings())
+            
             # Read and stream audio file
             with open(file_path, 'rb') as f:
                 file_size = os.path.getsize(file_path)
@@ -66,6 +88,10 @@ class SimpleDeepScribeClient:
             
             print("✅ File streaming complete")
             
+            # Clean up
+            if sys.platform == "win32":
+                ping_task.cancel()
+            
             # Send end stream signal
             await self.websocket.send("END_STREAM")
             print("📤 Sent END_STREAM signal")
@@ -86,6 +112,18 @@ class SimpleDeepScribeClient:
             return False
         finally:
             await self.disconnect()
+    
+    async def _send_periodic_pings(self):
+        """Send periodic pings to reset Windows timeout"""
+        try:
+            while True:
+                await asyncio.sleep(5.0)  # Every 10 seconds
+                # WebSocket protocol ping (not application-level)
+                if hasattr(self.websocket, 'ping'):
+                    await self.websocket.ping()
+                    print("🏓 Sent protocol ping")
+        except:
+            pass  # Connection closed
             
     async def _listen_for_results(self):
         """Listen for real-time results from server"""
