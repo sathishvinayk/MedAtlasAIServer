@@ -12,6 +12,16 @@ def extract_entities_keywords(text: str) -> List[MedicalEntity]:
     entities = []
     text_lower = text.lower()
     matched_positions = set()
+
+    symptom_patterns = {
+        'cough': r'\b(cough|coughing|dry cough|persistent cough|chronic cough)\b',
+        'dizziness': r'\b(dizziness|dizzy|lightheaded|vertigo)\b', 
+        'tired': r'\b(tired|fatigue|exhausted|weakness)\b',
+        'headache': r'\b(headache|head pain|migraine)\b',
+        'shortness of breath': r'\b(shortness of breath|sob|difficulty breathing|breathless)\b',
+        'nausea': r'\b(nausea|nauseous|sick to stomach)\b',
+        'chest pain': r'\b(chest pain|chest discomfort)\b'
+    }
     
     # Check for medication synonyms first
     for misspelling, canonical in MEDICATION_SYNONYMS.items():
@@ -26,6 +36,21 @@ def extract_entities_keywords(text: str) -> List[MedicalEntity]:
                     start=start,
                     end=end,
                     confidence=0.85  # High confidence for known synonyms
+                ))
+                matched_positions.add(position_key)
+
+    # Enhanced symptom detection
+    for symptom, pattern in symptom_patterns.items():
+        for match in re.finditer(pattern, text_lower):
+            start, end = match.start(), match.end()
+            position_key = (start, end)
+            if position_key not in matched_positions:
+                entities.append(MedicalEntity(
+                    entity="SYMPTOM",
+                    text=symptom,
+                    start=start,
+                    end=end,
+                    confidence=0.8
                 ))
                 matched_positions.add(position_key)
     
@@ -46,7 +71,8 @@ def extract_entities_keywords(text: str) -> List[MedicalEntity]:
                         confidence=0.8
                     ))
                     matched_positions.add(position_key)
-    
+                    
+    logger.info(f"🔍 KEYWORD EXTRACTION: Found {len(entities)} entities")
     return entities
 
 def deduplicate_entities(entities: List[MedicalEntity]) -> List[MedicalEntity]:

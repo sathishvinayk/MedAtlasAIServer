@@ -141,9 +141,12 @@ class NegationTemporalProcessor:
         # Negation patterns
         self.negation_patterns = [
             r'\b(no|not|denies|denied|without|negative|absence of|free of)\b',
-            r'\b(doesn\'t have|does not have|hasn\'t|has not)\b',
+            r'\b(doesn\'t have|does not have|hasn\'t|has not)\b', 
             r'\b(ruled out|excluded|dismissed)\b',
-            r'\b(unremarkable|normal|clear)\b.*\b(for|of)\b'
+            r'\b(unremarkable|normal|clear)\b.*\b(for|of)\b',
+            r'\b(no history of|no sign of|no evidence of)\b',  # ADDED
+            r'\b(negative|neg)\b.*\b(for|of)\b',  # ADDED
+            r'\b(declines|refutes)\b',  # ADDED
         ]
         
         # Temporal patterns for duration
@@ -185,7 +188,7 @@ class NegationTemporalProcessor:
             negation_matches = list(re.finditer(pattern, entity_context.lower()))
             for match in negation_matches:
                 # Check if negation is close to the entity (within 10 words)
-                if self._is_negation_proximal(match, entity_start, entity_context):
+                if self._is_negation_proximal(match, entity_start, entity_context):  # ← FIXED CALL
                     return {
                         "negated": True,
                         "negation_phrase": match.group(),
@@ -201,16 +204,45 @@ class NegationTemporalProcessor:
         end = min(len(text), entity_start + entity_length + window_size)
         return text[start:end]
 
-    def _is_negation_proximal(self, negation_match, entity_start: int, context: str, entity_text: str) -> bool:
+    def _is_negation_proximal(self, negation_match, entity_start: int, context: str) -> bool:
         """Check if negation is close enough to the entity to be relevant"""
-        # Simple proximity check - within 10 words or specific syntactic patterns
-        negation_pos = negation_match.start()
-        entity_pos_in_context = context.lower().find(entity_text.lower())  # ← FIXED        
-        if entity_pos_in_context == -1:
-            return False
+        try:
+            # Get positions within the context
+            negation_pos = negation_match.start()
             
-        distance = abs(negation_pos - entity_pos_in_context)
-        return distance < 150  # Character distance threshold
+            # Calculate where the entity appears in this context
+            # The context starts at (entity_start - window_size) in original text
+            window_size = 100  # Should match _get_entity_context
+            context_start_in_original = max(0, entity_start - window_size)
+            entity_pos_in_context = entity_start - context_start_in_original
+            
+            # If entity doesn't appear in this context, return False
+            if entity_pos_in_context < 0 or entity_pos_in_context >= len(context):
+                return False
+            
+            # Calculate distance between negation and entity in the context
+            distance = abs(negation_pos - entity_pos_in_context)
+            
+            # Use word-based distance for more accurate medical context
+            words_between = self._count_words_between(context, negation_pos, entity_pos_in_context)
+            
+            # Return True if within reasonable character AND word distance
+            return distance < 150 and words_between < 10
+            
+        except Exception as e:
+            logger.warning(f"Proximity check error: {e}")
+            return False
+
+    def _count_words_between(self, text: str, pos1: int, pos2: int) -> int:
+        """Count words between two positions in text"""
+        try:
+            start = min(pos1, pos2)
+            end = max(pos1, pos2)
+            segment = text[start:end]
+            words = re.findall(r'\b\w+\b', segment)
+            return len(words)
+        except:
+            return 999  # Return high number on error to fail safe
 
     def extract_temporal_info(self, text: str, entity_text: str, entity_start: int) -> Dict[str, any]:
         """Extract temporal information related to an entity"""
@@ -317,7 +349,6 @@ class NegationTemporalProcessor:
             }
         
         return None
-
 
 import re
 class MedicalConversationAnalyzer:
@@ -526,18 +557,9 @@ class RealTimeMedicalValidator:
     
     def __init__(self):
         self.dangerous_combinations = [
-            ("warfarin", "aspirin"),
-            ("lisinopril", "ibuprofen"), 
-            ("lisinopril", "naproxen"),  # Add more NSAIDs
-            ("ace_inhibitor", "nsaid"),   # Class-level interactions
-            ("metformin", "alcohol"),
-            ("simvastatin", "grapefruit"),
-            ("digoxin", "furosemide"),
-            ("levothyroxine", "calcium"),
-            ("phenytoin", "warfarin"),
-            # Add ACE inhibitor specific interactions
-            ("ace_inhibitor", "potassium_sparing_diuretics"),
-            ("ace_inhibitor", "lithium")
+            ("warfarin", "aspirin"),("lisinopril", "ibuprofen"), ("lisinopril", "naproxen"),("ace_inhibitor", "nsaid"),
+            ("metformin", "alcohol"),("simvastatin", "grapefruit"), ("digoxin", "furosemide"),("levothyroxine", "calcium"),
+            ("phenytoin", "warfarin"),("ace_inhibitor", "potassium_sparing_diuretics"),("ace_inhibitor", "lithium")
         ]
         
         self.red_flag_symptoms = [
@@ -581,20 +603,41 @@ class RealTimeMedicalValidator:
         ace_medications = []
         for med in medications:
             med_lower = med.lower()
-            if any(ace in med_lower for ace in ['lisinopril', 'enalapril', 'ramipril', 'ace inhibitor', 'ace']):
+             # Expanded ACE inhibitor detection
+            ace_indicators = [
+                'lisinopril', 'enalapril', 'ramipril', 'benazepril', 'quinapril',
+                'ace inhibitor', 'ace', 'pril', 'lisiniprol', 'lucinipral'
+            ]
+            if any(ace in med_lower for ace in ace_indicators):
                 ace_medications.append(med)
         
         if ace_medications:
+            logger.info(f"🔍 ACE INHIBITOR CHECK: Found {ace_medications} with symptoms {symptoms_lower}")
+
             # Check for ACE inhibitor cough
-            if 'cough' in symptoms_lower:
+            cough_terms = ['cough', 'coughing', 'dry cough', 'persistent cough', 'chronic cough']
+            cough_detected = any(any(term in symptom for term in cough_terms) for symptom in symptoms_lower)
+            if cough_detected:
                 alerts.append({
-                    "type": "side_effect_alert",
-                    "message": f"ACE inhibitor ({', '.join(ace_medications)}) may be causing persistent cough",
+                "type": "ace_inhibitor_cough",
+                "message": f"Classic ACE inhibitor side effect: {', '.join(ace_medications)} is likely causing persistent dry cough",
+                "severity": "high",
+                "entities": ace_medications,
+                "recommendation": "Strongly consider switching to ARB (losartan, valsartan) - cough typically resolves within 1-4 weeks after discontinuation"
+            })
+            # Enhanced dizziness detection
+            dizziness_terms = ['dizziness', 'dizzy', 'lightheaded', 'orthostatic']
+            dizziness_detected = any(any(term in symptom for term in dizziness_terms) for symptom in symptoms_lower)
+            
+            if dizziness_detected:
+                alerts.append({
+                    "type": "ace_inhibitor_hypotension", 
+                    "message": f"ACE inhibitor may be causing dizziness/orthostatic hypotension",
                     "severity": "moderate",
                     "entities": ace_medications,
-                    "recommendation": "Consider switching to ARB if cough persists"
+                    "recommendation": "Check blood pressure in sitting and standing positions, consider dose adjustment"
                 })
-            
+
             # Check for hyperkalemia risk symptoms
             hyperkalemia_symptoms = ['weakness', 'fatigue', 'palpitations', 'tired', 'dizziness']
             if any(symptom in ' '.join(symptoms_lower) for symptom in hyperkalemia_symptoms):
@@ -746,7 +789,7 @@ def generate_soap_note_rule_based(transcript: str, entities: List[MedicalEntity]
     
     # Extract blood pressure readings (your existing logic)
     bp_readings = []
-    bp_pattern = r'blood pressure.*?(\d+)\s*over\s*(\d+)|(\d+)\s*\/\s*(\d+)'
+    bp_pattern = r'\bblood pressure\s*(?:is|of|:)?\s*(\d{2,3})\s*\/\s*(\d{2,3})|\b(\d{2,3})\s*\/\s*(\d{2,3})\s*(?:mmhg|mmHg)'
     for match in re.finditer(bp_pattern, transcript_lower):
         if match.group(1) and match.group(2):
             bp_readings.append(f"{match.group(1)}/{match.group(2)}")
@@ -922,24 +965,12 @@ MEDICAL_KEYWORDS = {
 }
 
 MEDICATION_SYNONYMS = {
-    "laciniprol": "lisinopril",
-    "tylenol": "acetaminophen", 
-    "advil": "ibuprofen",
-    "motrin": "ibuprofen",
-    "lusinoprol": "lisinopril",
-    "lucinipral": "lisinopril",
-    "lizzanoprol": "lisinopril", 
-    "lissinoprol": "lisinopril",
-    "lysinoprol": "lisinopril",
-    "low-sorten": "losartan",
-    "losartin": "losartan",
-    "losertan": "losartan",
-    "cozaar": "losartan",
-    "lipitor": "atorvastatin",
-    "zocor": "simvastatin",
-    "glucophage": "metformin",
-    "vasotec": "enalapril",
-    "prinivil": "lisinopril",
+    "laciniprol": "lisinopril", "tylenol": "acetaminophen", "advil": "ibuprofen",
+    "motrin": "ibuprofen","lusinoprol": "lisinopril","lucinipral": "lisinopril",
+    "lizzanoprol": "lisinopril", "lissinoprol": "lisinopril","lysinoprol": "lisinopril",
+    "low-sorten": "losartan","losartin": "losartan","losertan": "losartan",
+    "cozaar": "losartan","lipitor": "atorvastatin","zocor": "simvastatin",
+    "glucophage": "metformin","vasotec": "enalapril","prinivil": "lisinopril",
     "zestril": "lisinopril"
 }
 
@@ -947,6 +978,7 @@ MEDICATION_SYNONYMS = {
 def extract_medical_entities_sync(text: str) -> Tuple[List[MedicalEntity], str]:
     entities = []
     model_used = "keyword-fallback"
+    logger.info(f"🔍 EXTRACTION DEBUG: Processing text: '{text[:100]}...'")
     
     global BIOBERT_MODEL, SPACY_MODEL
 
@@ -997,8 +1029,8 @@ def extract_medical_entities_sync(text: str) -> Tuple[List[MedicalEntity], str]:
             
             biobert_entities = []
             for entity in results:
-                # LOWER confidence threshold from 0.6 to 0.4 for better recall
-                if entity.get('score', 0) > 0.4:
+                # LOWER confidence threshold from 0.6 to 0.3 for better recall
+                if entity.get('score', 0) > 0.3:
                     entity_type = map_biobert_label_to_medical(
                         entity.get('entity_group', ''),
                         entity.get('word', '')
@@ -1031,7 +1063,7 @@ def extract_medical_entities_sync(text: str) -> Tuple[List[MedicalEntity], str]:
     
     # FALLBACK: Enhanced keyword extraction (only if both models failed)
     entities = extract_entities_keywords(text)
-    entities = filter_negated_entities(text, entities)
+    # entities = filter_negated_entities(text, entities)
     model_used = "keyword-fallback"
     logger.info(f"Keyword fallback extracted {len(entities)} entities")
     
@@ -1101,10 +1133,17 @@ class RealTimeMedicalProcessor:
         
         try:
             loop = asyncio.get_event_loop()
-            entities, _ = await loop.run_in_executor(
+            entities, model_used = await loop.run_in_executor(
                 self.processing_pool,
                 extract_medical_entities_with_negation_temporal, transcript
             )
+            
+            # 🔍 ADD THIS DEBUG
+            print(f"🔍 ENTITY EXTRACTION DEBUG: {len(entities)} entities found using {model_used}")
+            if entities:
+                print(f"🔍 FIRST ENTITY TYPE: {type(entities[0]).__name__}")
+                print(f"🔍 HAS NEGATED ATTR: {hasattr(entities[0], 'negated')}")
+            
             return entities
         except Exception as e:
             logger.error(f"Enhanced entity extraction error: {e}")
@@ -1126,19 +1165,34 @@ class RealTimeMedicalProcessor:
     def generate_enhanced_soap_note(self, transcript: str, entities: List[EnhancedMedicalEntity]) -> Dict[str, str]:
         """SOAP generation that actually uses negation/temporal info"""
         
+         # 🔍 ADD THIS DEBUG BLOCK
+        print(f"🔍 NEGATION DEBUG: Processing {len(entities)} entities for transcript: '{transcript[:100]}...'")
+        negated_count = 0
+        for i, entity in enumerate(entities):
+            if hasattr(entity, 'negated'):
+                if entity.negated:
+                    print(f"   🚫 NEGATED: '{entity.text}' (confidence: {entity.negation_confidence}, phrase: {entity.negation_phrase})")
+                    negated_count += 1
+                else:
+                    print(f"   ✅ ACTIVE: '{entity.text}'")
+            else:
+                print(f"   ⚠️ BASIC: '{entity.text}' (no negated attribute)")
+
+        print(f"🔍 NEGATION SUMMARY: {negated_count}/{len(entities)} entities are negated")
+        
         # Separate negated vs active symptoms
         active_symptoms = []
         negated_symptoms = []
         
         for entity in entities:
             if entity.entity == "SYMPTOM":
-                if entity.negated:
+                if hasattr(entity, 'negated') and entity.negated:
                     negated_symptoms.append(entity.text)
                 else:
                     symptom_desc = entity.text
-                    if entity.duration:
+                    if hasattr(entity, 'duration') and entity.duration:
                         symptom_desc += f" for {entity.duration}"
-                    if entity.onset:
+                    if hasattr(entity, 'onset') and entity.onset:
                         symptom_desc += f" since {entity.onset}"
                     active_symptoms.append(symptom_desc)
         
@@ -1554,10 +1608,22 @@ class RealTimeMedicalProcessor:
             
             # Extract entities (fast operation)
             entities = await self._extract_medical_entities_enhanced(transcript)  # ← CHANGED
+            # 🔍 ADD THIS DEBUG RIGHT AFTER ENTITY EXTRACTION
+            print(f"🔍 PROCESSING DEBUG: Extracted {len(entities)} entities for: '{transcript[:50]}...'")
+            if entities:
+                print(f"🔍 ENTITY TYPES IN BUFFER: {[type(e).__name__ for e in entities]}")
+                negated_entities = [e for e in entities if hasattr(e, 'negated') and e.negated]
+                print(f"🔍 NEGATED IN THIS CHUNK: {len(negated_entities)}")
+
             if entities:
                 # STORE ENTITIES WITH DEDUPLICATION
                 patient_context.extracted_entities.extend(entities)
                 patient_context.extracted_entities = deduplicate_entities(patient_context.extracted_entities)
+
+                 # 🔍 ADD DEBUG FOR STORED ENTITIES
+                print(f"🔍 STORED ENTITIES COUNT: {len(patient_context.extracted_entities)}")
+                stored_negated = [e for e in patient_context.extracted_entities if hasattr(e, 'negated') and e.negated]
+                print(f"🔍 TOTAL NEGATED STORED: {len(stored_negated)}")
                 
                 self._update_patient_context_enhanced(patient_context, entities)  # ← CHANGED
                 
@@ -1844,7 +1910,6 @@ class EnhancedMedicalProcessor(RealTimeMedicalProcessor):
         except Exception as e:
             logger.error(f"Enhanced entity extraction error: {e}")
             return []
-        
 
 def perform_diarization(audio_path: str) -> List[SpeakerSegment]:
     """Perform speaker diarization using pyannote"""
@@ -2456,6 +2521,37 @@ async def websocket_realtime_audio(websocket: WebSocket):
     finally:
         logger.info(f"🔚 WebSocket session ended: {session_id}")
 
+def test_negation_detection():
+    """Test if negation detection works on basic examples"""
+    print("\n" + "="*60)
+    print("🧪 TESTING NEGATION PATTERNS")
+    print("="*60)
+    
+    processor = NegationTemporalProcessor()
+    
+    # Test cases that SHOULD trigger negation
+    test_cases = [
+        "I have no chest pain",
+        "Patient denies shortness of breath",
+        "No fever or chills present", 
+        "Negative for diabetes",
+        "Without any nausea",
+        "I don't have headache"
+    ]
+    
+    for text in test_cases:
+        print(f"\n📝 Testing: '{text}'")
+        # Extract entities first
+        entities = extract_medical_entities_sync(text)[0]
+        
+        for entity in entities:
+            negation_info = processor.detect_negation(text, entity.text, entity.start)
+            print(f"  🔍 '{entity.text}': negated={negation_info['negated']} (confidence: {negation_info['confidence']})")
+            if negation_info['negated']:
+                print(f"     🎯 NEGATION PHRASE: '{negation_info['negation_phrase']}'")
+
+
+
 @app.get("/health")
 async def health():
     return {
@@ -2489,6 +2585,8 @@ async def root():
     }
 
 if __name__ == "__main__":
+    print("🚀 Starting negation detection test...")
+    test_negation_detection()
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000,  ws_ping_interval=5,
         ws_ping_timeout=10,
