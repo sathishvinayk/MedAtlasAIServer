@@ -1,9 +1,28 @@
 # Keep the MEDICAL_KEYWORDS and other constants from your original code
 MEDICAL_KEYWORDS = {
-    "SYMPTOM": ["headache", "fever", "cough", "pain", "nausea", "dizziness", 
-                "fatigue", "tired", "tiredness", "shortness of breath", 
-                "dry cough", "exhaustion", "weakness", "nausea", "chest pain",
-                "sore throat", "body aches", "chills", "sweating", "vomiting"],
+    "SYMPTOM": [
+        # Headache patterns
+        "headache", "headaches", "migraine", "migraines", "head pain", 
+        "pressure in my head", "band around my head", "head pounding",
+        "head throbbing", "head hurts", "head ache",
+        
+        # Nausea patterns
+        "nausea", "nauseous", "queasy", "upset stomach", "feel sick", 
+        "feel like throwing up", "stomach upset",
+        
+        # Dizziness patterns
+        "dizziness", "dizzy", "lightheaded", "light-headed", "vertigo",
+        "room spinning", "feel faint", "unsteady",
+        
+        # Existing symptoms
+        "fever", "cough", "pain", "fatigue", "tired", "tiredness", 
+        "shortness of breath", "dry cough", "exhaustion", "weakness",
+        "chest pain", "sore throat", "body aches", "chills", "sweating", "vomiting",
+        
+        # Vision patterns
+        "blurred vision", "blurry vision", "sensitivity to light", "light bothers me",
+        "eyes sensitive", "vision problems"
+    ],
     "MEDICATION": ["ibuprofen", "aspirin", "amoxicillin", "lisinopril", 
                   "laciniprol", "metformin", "tylenol", "advil", "atenolol",
                   "amlodipine", "simvastatin", "atorvastatin", "omeprazole",
@@ -19,18 +38,31 @@ MEDICAL_KEYWORDS = {
 }
 
 MEDICATION_SYNONYMS = {
+    # ACE Inhibitors
     "laciniprol": "lisinopril",
-    "tylenol": "acetaminophen", 
-    "advil": "ibuprofen",
-    "motrin": "ibuprofen",
+    "lucinipral": "lisinopril", 
+    "luciniprol": "lisinopril",
     "lusinoprol": "lisinopril",
     "lucinipral": "lisinopril",
-    "lizzanoprol": "lisinopril", 
+    "lizzanoprol": "lisinopril",
     "lissinoprol": "lisinopril",
     "lysinoprol": "lisinopril",
+    "lizanoprol": "lisinopril",
+    
+    # ARBs
     "low-sorten": "losartan",
     "losartin": "losartan",
     "losertan": "losartan",
+    "lossarton": "losartan",  # ADDED
+    "los arden": "losartan",  # ADDED
+    
+    # Pain medications
+    "tylenol": "acetaminophen",
+    "advil": "ibuprofen",
+    "motrin": "ibuprofen",
+    "ibuprophen": "ibuprofen",  # ADDED
+    
+    # Existing mappings
     "cozaar": "losartan",
     "lipitor": "atorvastatin",
     "zocor": "simvastatin",

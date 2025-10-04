@@ -25,17 +25,22 @@ from transformers import (
 )
 import tempfile  # Make sure this is imported
 import os
-from utils import normalize_medication_name, truncate_text, get_audio_duration, map_spacy_label_to_medical, universal_transcript, temp_audio_file, map_biobert_label_to_medical, align_transcription_with_speakers
+# from utils import normalize_medication_name, truncate_text, get_audio_duration, map_spacy_label_to_medical, universal_transcript, temp_audio_file, map_biobert_label_to_medical, align_transcription_with_speakers
 # from soap_generator import generate_soap_note_rule_based
 from audio_models import ProcessAudioRequest, ProcessAudioResponse
-from shared_models import (
-    MedicalEntity, 
-    SpeakerSegment
-)
-from entity_extractor import extract_entities_keywords, deduplicate_entities, filter_negated_entities, extract_medication_changes, extract_medical_patterns
-from constants import MEDICAL_KEYWORDS
+# from shared_models import (
+#     MedicalEntity, 
+#     SpeakerSegment
+# )
+from datetime import datetime, timedelta
+from dateutil.parser import parse
+from dateutil.relativedelta import relativedelta
+# from entity_extractor import extract_entities_keywords, deduplicate_entities, filter_negated_entities, extract_medication_changes, extract_medical_patterns
+# from constants import MEDICAL_KEYWORDS
 from config import WHISPER_MODEL_SIZE, MEDICAL_LLM_NAME, PYANNOTE_AUTH_TOKEN
 from audioStreamProcessor import AudioStreamProcessor
+import numpy as np
+
 # from shared_models import RealtimeResult, PatientContext
 # from medical_conversation_analyzer import MedicalConversationAnalyzer
 # from real_time_medical_validator import RealTimeMedicalValidator
@@ -111,7 +116,6 @@ _pyannote_lock = Lock()  # Add pyannote lock
 _model_load_lock = Lock()
 _models_loaded = False
 
-# Pydantic Models (unchanged)
 class MedicalEntity(BaseModel):
     entity: str = Field(..., description="Type of medical entity (SYMPTOM, MEDICATION, etc.)")
     text: str = Field(..., description="The actual text of the entity")
@@ -130,9 +134,111 @@ class EnhancedMedicalEntity(MedicalEntity):
     normalized_onset: Optional[str] = Field(default=None, description="Normalized onset time")
     temporal_context: Optional[str] = Field(default=None, description="Temporal context")
 
-from datetime import datetime, timedelta
-from dateutil.parser import parse
-from dateutil.relativedelta import relativedelta
+class SpeakerSegment(BaseModel):
+    speaker: str = Field(..., description="Speaker identifier")
+    start: float = Field(..., description="Start time in seconds")
+    end: float = Field(..., description="End time in seconds")
+    text: str = Field(..., description="Transcribed text for this segment")
+
+@dataclass
+class PatientContext:
+    """Patient context maintained throughout the conversation"""
+    session_id: str
+    conversation_history: List[str] = field(default_factory=list)
+    current_symptoms: List[str] = field(default_factory=list)
+    medications: List[str] = field(default_factory=list)
+    medical_history: List[str] = field(default_factory=list)
+    soap_note_sections: Dict[str, str] = field(default_factory=lambda: {
+        "subjective": "", "objective": "", "assessment": "", "plan": ""
+    })
+    extracted_entities: List[EnhancedMedicalEntity] = field(default_factory=list)
+    start_time: float = field(default_factory=time.time)
+    audio_buffer: bytearray = field(default_factory=bytearray)
+    last_activity: float = field(default_factory=time.time)
+
+@dataclass
+class RealtimeResult:
+    """Internal real-time processing result"""
+    type: str  # "transcript", "entities", "soap_update", "medical_alert"
+    data: Dict[str, Any]
+    session_id: str
+    is_partial: bool = True
+    timestamp: float = field(default_factory=time.time)
+    confidence: float = 0.9
+
+# Keep the MEDICAL_KEYWORDS and other constants from your original code
+MEDICAL_KEYWORDS = {
+    "SYMPTOM": [
+        # Headache patterns
+        "headache", "headaches", "migraine", "migraines", "head pain", 
+        "pressure in my head", "band around my head", "head pounding",
+        "head throbbing", "head hurts", "head ache",
+        
+        # Nausea patterns
+        "nausea", "nauseous", "queasy", "upset stomach", "feel sick", 
+        "feel like throwing up", "stomach upset",
+        
+        # Dizziness patterns
+        "dizziness", "dizzy", "lightheaded", "light-headed", "vertigo",
+        "room spinning", "feel faint", "unsteady",
+        
+        # Existing symptoms
+        "fever", "cough", "pain", "fatigue", "tired", "tiredness", 
+        "shortness of breath", "dry cough", "exhaustion", "weakness",
+        "chest pain", "sore throat", "body aches", "chills", "sweating", "vomiting",
+        
+        # Vision patterns
+        "blurred vision", "blurry vision", "sensitivity to light", "light bothers me",
+        "eyes sensitive", "vision problems"
+    ],
+    "MEDICATION": ["ibuprofen", "aspirin", "amoxicillin", "lisinopril", 
+                  "laciniprol", "metformin", "tylenol", "advil", "atenolol",
+                  "amlodipine", "simvastatin", "atorvastatin", "omeprazole",
+                  "acetaminophen", "warfarin", "insulin", "prednisone"],
+    "DIAGNOSIS": ["hypertension", "high blood pressure", "diabetes", 
+                 "migraine", "infection", "arthritis", "asthma", "pneumonia",
+                 "bronchitis", "influenza", "covid", "coronary artery disease",
+                 "heart failure", "copd", "depression", "anxiety"],
+    "BODY_PART": ["head", "chest", "arm", "leg", "back", "stomach", "throat",
+                 "neck", "abdomen", "heart", "lungs", "kidney", "liver"],
+    "PROCEDURE": ["surgery", "operation", "biopsy", "scan", "x-ray", "mri"],
+    "LAB_TEST": ["blood test", "urine test", "ct scan", "ekg", "ecg"]
+}
+
+MEDICATION_SYNONYMS = {
+    # ACE Inhibitors
+    "laciniprol": "lisinopril",
+    "lucinipral": "lisinopril", 
+    "luciniprol": "lisinopril",
+    "lusinoprol": "lisinopril",
+    "lucinipral": "lisinopril",
+    "lizzanoprol": "lisinopril",
+    "lissinoprol": "lisinopril",
+    "lysinoprol": "lisinopril",
+    "lizanoprol": "lisinopril",
+    
+    # ARBs
+    "low-sorten": "losartan",
+    "losartin": "losartan",
+    "losertan": "losartan",
+    "lossarton": "losartan",  # ADDED
+    "los arden": "losartan",  # ADDED
+    
+    # Pain medications
+    "tylenol": "acetaminophen",
+    "advil": "ibuprofen",
+    "motrin": "ibuprofen",
+    "ibuprophen": "ibuprofen",  # ADDED
+    
+    # Existing mappings
+    "cozaar": "losartan",
+    "lipitor": "atorvastatin",
+    "zocor": "simvastatin",
+    "glucophage": "metformin",
+    "vasotec": "enalapril",
+    "prinivil": "lisinopril",
+    "zestril": "lisinopril"
+}
 
 class NegationTemporalProcessor:
     """Handles negation detection and temporal normalization for medical entities"""
@@ -151,10 +257,14 @@ class NegationTemporalProcessor:
         
         # Temporal patterns for duration
         self.duration_patterns = [
-            r'\bfor\s+(\d+)\s*(day|days|week|weeks|month|months|year|years|hour|hours)\b',
+            r'\bfor\s+(\d+)\s*(day|days|week|weeks|month|months|year|years|hour|hours|minute|minutes)\b',
             r'\b(\d+)\s*(day|days|week|weeks|month|months|year|years|hour|hours)\s+ago\b',
             r'\blast\s*(night|week|month|year)\b',
-            r'\bpast\s+(\d+)\s*(day|days|week|weeks|month|months)\b'
+            r'\bpast\s+(\d+)\s*(day|days|week|weeks|month|months)\b',
+            r'\bfor the past\s+(\d+)\s*(day|days|week|weeks|month|months)\b',  # ADDED
+            r'\bfor the last\s+(\d+)\s*(day|days|week|weeks|month|months)\b',  # ADDED
+            r'\bover the past\s+(\d+)\s*(day|days|week|weeks)\b',  # ADDED
+            r'\bsince last\s+(week|month|night)\b',  # ADDED
         ]
         
         # Temporal patterns for onset
@@ -163,7 +273,10 @@ class NegationTemporalProcessor:
             r'\bstarted\s+(.*?)(?=\.|,|$)',
             r'\bbegan\s+(.*?)(?=\.|,|$)',
             r'\bonset\s+(.*?)(?=\.|,|$)',
-            r'\b(?:since|from)\s+(yesterday|last night|last week|last month)\b'
+            r'\b(?:since|from)\s+(yesterday|last night|last week|last month)\b',
+            r'\b(?:in|during)\s+(the\s+)?(morning|afternoon|evening|night)\b',  # ADDED
+            r'\bwhen\s+I\s+(.*?)(?=\.|,|$)',  # ADDED - "when I stand up"
+            r'\bafter\s+I\s+(.*?)(?=\.|,|$)',  # ADDED - "after I've been at the computer"
         ]
         
         # Relative time mappings
@@ -551,7 +664,6 @@ class EnhancedSOAPBuilder(ProgressiveSOAPBuilder):
         
         return ". ".join(assessment_parts) if assessment_parts else "Ongoing assessment"
     
-from typing import List, Dict
 class RealTimeMedicalValidator:
     """Validates medical content in real-time"""
     
@@ -734,45 +846,6 @@ class RealTimeMedicalValidator:
         
         return alerts
 
-class MedicalEntity(BaseModel):
-    entity: str = Field(..., description="Type of medical entity (SYMPTOM, MEDICATION, etc.)")
-    text: str = Field(..., description="The actual text of the entity")
-    start: int = Field(..., description="Start character position in text")
-    end: int = Field(..., description="End character position in text")
-    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score 0-1")
-
-class SpeakerSegment(BaseModel):
-    speaker: str = Field(..., description="Speaker identifier")
-    start: float = Field(..., description="Start time in seconds")
-    end: float = Field(..., description="End time in seconds")
-    text: str = Field(..., description="Transcribed text for this segment")
-
-@dataclass
-class PatientContext:
-    """Patient context maintained throughout the conversation"""
-    session_id: str
-    conversation_history: List[str] = field(default_factory=list)
-    current_symptoms: List[str] = field(default_factory=list)
-    medications: List[str] = field(default_factory=list)
-    medical_history: List[str] = field(default_factory=list)
-    soap_note_sections: Dict[str, str] = field(default_factory=lambda: {
-        "subjective": "", "objective": "", "assessment": "", "plan": ""
-    })
-    extracted_entities: List[EnhancedMedicalEntity] = field(default_factory=list)
-    start_time: float = field(default_factory=time.time)
-    audio_buffer: bytearray = field(default_factory=bytearray)
-    last_activity: float = field(default_factory=time.time)
-
-@dataclass
-class RealtimeResult:
-    """Internal real-time processing result"""
-    type: str  # "transcript", "entities", "soap_update", "medical_alert"
-    data: Dict[str, Any]
-    session_id: str
-    is_partial: bool = True
-    timestamp: float = field(default_factory=time.time)
-    confidence: float = 0.9
-
 def generate_soap_note_rule_based(transcript: str, entities: List[MedicalEntity]) -> Dict[str, str]:
     """Enhanced rule-based SOAP note returning structured data"""
     symptoms = sorted(set(e.text for e in entities if e.entity == "SYMPTOM"))
@@ -944,36 +1017,6 @@ def build_plan_section(symptoms: list, medications: list, transcript_lower: str,
     
     return "\n".join(f"- {part}" for part in parts)
 
-# Keep the MEDICAL_KEYWORDS and other constants from your original code
-MEDICAL_KEYWORDS = {
-    "SYMPTOM": ["headache", "fever", "cough", "pain", "nausea", "dizziness", 
-                "fatigue", "tired", "tiredness", "shortness of breath", 
-                "dry cough", "exhaustion", "weakness", "nausea", "chest pain",
-                "sore throat", "body aches", "chills", "sweating", "vomiting"],
-    "MEDICATION": ["ibuprofen", "aspirin", "amoxicillin", "lisinopril", 
-                  "laciniprol", "metformin", "tylenol", "advil", "atenolol",
-                  "amlodipine", "simvastatin", "atorvastatin", "omeprazole",
-                  "acetaminophen", "warfarin", "insulin", "prednisone"],
-    "DIAGNOSIS": ["hypertension", "high blood pressure", "diabetes", 
-                 "migraine", "infection", "arthritis", "asthma", "pneumonia",
-                 "bronchitis", "influenza", "covid", "coronary artery disease",
-                 "heart failure", "copd", "depression", "anxiety"],
-    "BODY_PART": ["head", "chest", "arm", "leg", "back", "stomach", "throat",
-                 "neck", "abdomen", "heart", "lungs", "kidney", "liver"],
-    "PROCEDURE": ["surgery", "operation", "biopsy", "scan", "x-ray", "mri"],
-    "LAB_TEST": ["blood test", "urine test", "ct scan", "ekg", "ecg"]
-}
-
-MEDICATION_SYNONYMS = {
-    "laciniprol": "lisinopril", "tylenol": "acetaminophen", "advil": "ibuprofen",
-    "motrin": "ibuprofen","lusinoprol": "lisinopril","lucinipral": "lisinopril",
-    "lizzanoprol": "lisinopril", "lissinoprol": "lisinopril","lysinoprol": "lisinopril",
-    "low-sorten": "losartan","losartin": "losartan","losertan": "losartan",
-    "cozaar": "losartan","lipitor": "atorvastatin","zocor": "simvastatin",
-    "glucophage": "metformin","vasotec": "enalapril","prinivil": "lisinopril",
-    "zestril": "lisinopril"
-}
-
 # Main entity extraction function (unchanged)
 def extract_medical_entities_sync(text: str) -> Tuple[List[MedicalEntity], str]:
     entities = []
@@ -1097,6 +1140,7 @@ def extract_medical_entities_with_negation_temporal(text: str) -> Tuple[List[Enh
         enhanced_entities.append(enhanced_entity)
     
     return enhanced_entities, f"{model_used}+negation_temporal"
+
 class RealTimeMedicalProcessor:
     """Optimized real-time medical audio processor"""
     
@@ -1911,34 +1955,364 @@ class EnhancedMedicalProcessor(RealTimeMedicalProcessor):
             logger.error(f"Enhanced entity extraction error: {e}")
             return []
 
-def perform_diarization(audio_path: str) -> List[SpeakerSegment]:
-    """Perform speaker diarization using pyannote"""
-    global PYANNOTE_PIPELINE
+# Keyword-based entity extraction (unchanged)
+def extract_entities_keywords(text: str) -> List[MedicalEntity]:
+    """Enhanced keyword extraction with partial matching"""
+    entities = []
+    text_lower = text.lower()
+    matched_positions = set()
+
+    symptom_patterns = {
+        'cough': r'\b(cough|coughing|dry cough|persistent cough|chronic cough)\b',
+        'dizziness': r'\b(dizziness|dizzy|lightheaded|vertigo)\b', 
+        'tired': r'\b(tired|fatigue|exhausted|weakness)\b',
+        'headache': r'\b(headache|head pain|migraine)\b',
+        'shortness of breath': r'\b(shortness of breath|sob|difficulty breathing|breathless)\b',
+        'nausea': r'\b(nausea|nauseous|sick to stomach)\b',
+        'chest pain': r'\b(chest pain|chest discomfort)\b'
+    }
     
-    if PYANNOTE_PIPELINE is None:
-        logger.warning("Pyannote pipeline not available, skipping diarization")
-        return []
-    
-    try:
-        with _pyannote_lock:
-            # Apply the pipeline to the audio file
-            diarization = PYANNOTE_PIPELINE(audio_path)
-            
-            segments = []
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
-                segments.append(SpeakerSegment(
-                    speaker=speaker,
-                    start=round(turn.start, 2),
-                    end=round(turn.end, 2),
-                    text=""  # This will be filled with transcription later
+    # Check for medication synonyms first
+    for misspelling, canonical in MEDICATION_SYNONYMS.items():
+        pattern = r"\b" + re.escape(misspelling) + r"\b"
+        for match in re.finditer(pattern, text_lower):
+            start, end = match.start(), match.end()
+            position_key = (start, end)
+            if position_key not in matched_positions:
+                entities.append(MedicalEntity(
+                    entity="MEDICATION",
+                    text=canonical,  # Use canonical name
+                    start=start,
+                    end=end,
+                    confidence=0.85  # High confidence for known synonyms
                 ))
-            
-            logger.info(f"Diarization completed: {len(segments)} segments found")
-            return segments
-            
-    except Exception as e:
-        logger.error(f"Pyannote diarization failed: {e}")
+                matched_positions.add(position_key)
+
+    # Enhanced symptom detection
+    for symptom, pattern in symptom_patterns.items():
+        for match in re.finditer(pattern, text_lower):
+            start, end = match.start(), match.end()
+            position_key = (start, end)
+            if position_key not in matched_positions:
+                entities.append(MedicalEntity(
+                    entity="SYMPTOM",
+                    text=symptom,
+                    start=start,
+                    end=end,
+                    confidence=0.8
+                ))
+                matched_positions.add(position_key)
+    
+    # Then check regular medical keywords
+    for entity_type, keywords in MEDICAL_KEYWORDS.items():
+        for keyword in keywords:
+            pattern = r"\b" + re.escape(keyword) + r"\b"
+            for match in re.finditer(pattern, text_lower):
+                start, end = match.start(), match.end()
+                
+                position_key = (start, end)
+                if position_key not in matched_positions:
+                    entities.append(MedicalEntity(
+                        entity=entity_type,
+                        text=text[start:end],
+                        start=start,
+                        end=end,
+                        confidence=0.8
+                    ))
+                    matched_positions.add(position_key)
+                    
+    logger.info(f"🔍 KEYWORD EXTRACTION: Found {len(entities)} entities")
+    return entities
+
+def deduplicate_entities(entities: List[MedicalEntity]) -> List[MedicalEntity]:
+    if not entities:
         return []
+    
+    # Sort by start position and length (longer first)
+    entities.sort(key=lambda x: (x.start, -(x.end - x.start)))
+    
+    unique_entities = []
+    seen_texts = set()
+    
+    for entity in entities:
+        # Normalize text for comparison
+        normalized_text = entity.text.lower().strip()
+        
+        # Check for exact duplicates
+        if normalized_text in seen_texts:
+            continue
+            
+        # Check for overlapping entities (keep the longer one)
+        overlapping = False
+        for selected in unique_entities:
+            if (entity.start < selected.end and entity.end > selected.start):
+                # If current entity is longer, replace the existing one
+                if (entity.end - entity.start) > (selected.end - selected.start):
+                    unique_entities.remove(selected)
+                    seen_texts.discard(selected.text.lower().strip())
+                else:
+                    overlapping = True
+                break
+        
+        if not overlapping:
+            unique_entities.append(entity)
+            seen_texts.add(normalized_text)
+    
+    return unique_entities
+
+def filter_negated_entities(transcript: str, entities: List[MedicalEntity]) -> List[MedicalEntity]:
+    """Filter out entities that are mentioned in negative context"""
+    filtered_entities = []
+    transcript_lower = transcript.lower()
+    
+    negation_phrases = [
+        "no ", "not ", "denies ", "denied ", "without ", "negative for ",
+        "never ", "none ", "doesn't have ", "haven't had "
+    ]
+    
+    for entity in entities:
+        entity_text = entity.text.lower()
+        start, end = entity.start, entity.end
+        
+        # Check if the entity appears in a negative context
+        context_start = max(0, start - 50)
+        context_end = min(len(transcript), end + 20)
+        context = transcript_lower[context_start:context_end]
+        
+        is_negated = any(neg in context for neg in negation_phrases)
+        
+        if not is_negated:
+            filtered_entities.append(entity)
+        else:
+            logger.info(f"Filtered out negated entity: {entity.text}")
+    
+    return filtered_entities
+
+def extract_medical_patterns(text: str) -> List[MedicalEntity]:
+    """Enhanced pattern matching for structured clinical data"""
+    entities = []
+    
+    # Blood pressure patterns
+    bp_patterns = [
+        r'blood pressure.*?(\d+)\s*\/\s*over\s*(\d+)',
+        r'(\d+)\s*over\s*(\d+).*?blood pressure',
+        r'bp.*?(\d+)\s*\/\s*(\d+)'
+    ]
+    
+    for pattern in bp_patterns:
+        for match in re.finditer(pattern, text.lower()):
+            entities.append(MedicalEntity(
+                entity="VITAL_SIGN",
+                text=f"BP {match.group(1)}/{match.group(2)}",
+                start=match.start(),
+                end=match.end(),
+                confidence=0.95
+            ))
+    
+    # Heart rate patterns
+    hr_patterns = [
+        r'heart rate.*?(\d+)',
+        r'pulse.*?(\d+)',
+        r'hr.*?(\d+)'
+    ]
+    
+    for pattern in hr_patterns:
+        for match in re.finditer(pattern, text.lower()):
+            entities.append(MedicalEntity(
+                entity="VITAL_SIGN", 
+                text=f"HR {match.group(1)}",
+                start=match.start(),
+                end=match.end(),
+                confidence=0.9
+            ))
+    
+    return entities
+
+def extract_medication_changes(text: str) -> List[MedicalEntity]:
+    """Detect medication start/stop/switch actions"""
+    entities = []
+    
+    # Medication action patterns
+    change_patterns = [
+        (r'start.*?(losartan|lisinopril|metformin|amlodipine)', "MEDICATION_START"),
+        (r'stop.*?(losartan|lisinopril|metformin|amlodipine)', "MEDICATION_STOP"), 
+        (r'switch.*?to.*?(losartan|lisinopril|metformin|amlodipine)', "MEDICATION_SWITCH"),
+        (r'change.*?to.*?(losartan|lisinopril|metformin|amlodipine)', "MEDICATION_SWITCH"),
+        (r'discontinue.*?(losartan|lisinopril|metformin|amlodipine)', "MEDICATION_STOP"),
+    ]
+    
+    for pattern, action in change_patterns:
+        for match in re.finditer(pattern, text.lower()):
+            entities.append(MedicalEntity(
+                entity=action,
+                text=match.group(0),
+                start=match.start(),
+                end=match.end(),
+                confidence=0.9
+            ))
+    
+    return entities
+
+# Temporary file context manager (unchanged)
+@asynccontextmanager
+async def temp_audio_file(audio_bytes: bytes):
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(audio_bytes)
+            temp_path = tmp.name
+        yield temp_path
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except Exception as e:
+                logger.warning(f"Failed to delete temp file {temp_path}: {e}")
+
+def map_spacy_label_to_medical(label: str) -> str:
+    mapping = {
+        "DISEASE": "DIAGNOSIS",
+        "CONDITION": "DIAGNOSIS",
+        "SYMPTOM": "SYMPTOM",
+        "MEDICATION": "MEDICATION",
+        "DRUG": "MEDICATION",
+        "BODY_PART": "BODY_PART",
+        "ORG": "ORGANIZATION",
+        "PERSON": "PERSON",
+        "DATE": "DATE",
+        "TIME": "TIME"
+    }
+    return mapping.get(label, "OTHER")
+
+# Utility functions (unchanged except for SOAP generation)
+def normalize_medication_name(med_name: str) -> Tuple[str, float]:
+    """Normalize medication name and return with adjusted confidence"""
+    original_confidence = 0.9  # Default confidence
+    
+    med_name_lower = med_name.lower().strip()
+    
+    # Common medication misspellings and corrections
+    medication_corrections = {
+        "laciniprol": ("lisinopril", 0.8),  # Lower confidence for corrected spellings
+        "metforman": ("metformin", 0.8),
+        "ibuprofin": ("ibuprofen", 0.8),
+        "amoxicilin": ("amoxicillin", 0.8),
+        "asprin": ("aspirin", 0.8),
+    }
+    
+    if med_name_lower in medication_corrections:
+        corrected_name, confidence = medication_corrections[med_name_lower]
+        return corrected_name, confidence
+    
+    # For properly spelled medications, keep original confidence
+    return med_name, original_confidence
+
+def truncate_text(text: str, max_length: int) -> str:
+    """Truncate text to max_length, preserving word boundaries"""
+    if len(text) <= max_length:
+        return text
+    
+    # Find the last space within the limit
+    truncated = text[:max_length]
+    last_space = truncated.rfind(' ')
+    
+    if last_space > 0:
+        return truncated[:last_space] + "..."
+    else:
+        return truncated + "..."
+    
+# Add function to get audio duration
+def get_audio_duration(audio_path: str) -> float:
+    """Get audio duration in seconds"""
+    try:
+        info = torchaudio.info(audio_path)
+        return info.num_frames / info.sample_rate
+    except Exception as e:
+        logger.warning(f"Could not get audio duration: {e}")
+        return 0
+    
+def universal_embedding(text: str, dimensions: int = 384) -> List[float]:
+    text_hash = hashlib.sha256(text.encode()).hexdigest()
+    seed = int(text_hash[:8], 16)
+    
+    rng = np.random.default_rng(seed)
+    embedding = rng.standard_normal(dimensions).astype(np.float32)
+    
+    norm = np.linalg.norm(embedding)
+    if norm > 0:
+        embedding = embedding / norm
+    
+    return embedding.tolist()
+
+def universal_transcript(audio_path: str) -> str:
+    with open(audio_path, "rb") as f:
+        audio_hash = hashlib.sha256(f.read()).hexdigest()
+    
+    seed = int(audio_hash[:8], 16)
+    rng = np.random.default_rng(seed)
+
+    symptoms = ["headache", "fever", "cough", "chest pain", "fatigue", "dizziness"]
+    medications = ["ibuprofen", "amoxicillin", "lisinopril", "metformin"]
+
+    random_symptoms = rng.choice(symptoms, size=2, replace=False)
+    random_med = rng.choice(medications, size=1)[0]
+
+    return f"Patient presents with {' and '.join(random_symptoms)}. Currently taking {random_med}. Denies other symptoms. Vital signs stable."
+
+
+# Model mapping functions (unchanged)
+def map_biobert_label_to_medical(label: str, token_text: str) -> str:
+    """Enhanced BioBERT label mapping"""
+    label_upper = label.upper()
+    token_lower = token_text.lower()
+    
+    # Enhanced mapping for BioBERT labels
+    if any(x in label_upper for x in ["DISEASE", "DIAG", "CONDITION", "PROBLEM"]):
+        return "DIAGNOSIS"
+    if any(x in label_upper for x in ["CHEM", "DRUG", "MED", "TREATMENT"]):
+        return "MEDICATION"
+    if any(x in label_upper for x in ["SYMPTOM", "SIGN", "COMPLAINT"]):
+        return "SYMPTOM"
+    if any(x in label_upper for x in ["ANATOMY", "BODY", "LOC", "ORGAN"]):
+        return "BODY_PART"
+    
+    # Check medication synonyms
+    if token_lower in MEDICATION_SYNONYMS:
+        return "MEDICATION"
+    
+    # Fallback to keyword matching
+    for ent_type, keywords in MEDICAL_KEYWORDS.items():
+        if token_lower in keywords:
+            return ent_type
+    
+    return "OTHER"
+
+# Add function to align transcription with speaker segments
+def align_transcription_with_speakers(transcript: str, speaker_segments: List[SpeakerSegment], audio_duration: float) -> List[SpeakerSegment]:
+    """Align Whisper transcription with speaker segments"""
+    if not speaker_segments or not transcript:
+        return speaker_segments
+    
+    # Simple approach: split transcript by sentences and assign to speakers based on time
+    sentences = transcript.split('. ')
+    total_chars = len(transcript)
+    
+    # Calculate character rate (chars per second)
+    if audio_duration > 0:
+        char_rate = total_chars / audio_duration
+    else:
+        # Fallback: assume 10 characters per second
+        char_rate = 10
+    
+    # Assign text to segments based on timing
+    for segment in speaker_segments:
+        segment_duration = segment.end - segment.start
+        expected_chars = int(segment_duration * char_rate)
+        
+        # This is a simplified approach - in production, you'd want a more sophisticated alignment
+        segment.text = f"Speaker {segment.speaker} segment from {segment.start}s to {segment.end}s"
+    
+    return speaker_segments
 
 # Load spaCy with EntityRuler (unchanged)
 def load_spacy_with_ruler():
@@ -1961,92 +2335,6 @@ def load_spacy_with_ruler():
     except Exception as e:
         logger.warning(f"spaCy with EntityRuler failed: {e}")
         return None
-
-# NEW: LLM-based SOAP note generation
-def generate_soap_note_llm(transcript: str, entities: List[MedicalEntity]) -> str:
-    """Generate SOAP note using fine-tuned medical LLM"""
-    global MEDICAL_LLM, MEDICAL_TOKENIZER
-    
-    if MEDICAL_LLM is None or MEDICAL_TOKENIZER is None:
-        logger.warning("Medical LLM not available, falling back to rule-based SOAP")
-        return generate_soap_note_rule_based(transcript, entities)
-    
-    try:
-        with _llm_lock:
-            # Prepare context from extracted entities
-            symptoms = sorted(set(e.text for e in entities if e.entity == "SYMPTOM"))
-            medications = sorted(set(
-                normalize_medication_name(e.text)[0]
-                for e in entities if e.entity == "MEDICATION"
-            ))
-            
-            # Construct prompt for medical LLM
-            prompt = f"""<s>[INST] <<SYS>>
-                You are a medical assistant trained to generate comprehensive SOAP notes from patient transcripts.
-                Generate a structured SOAP note following this format:
-
-                SUBJECTIVE:
-                - Patient's reported symptoms and concerns
-                - Relevant medical history from conversation
-
-                OBJECTIVE:
-                - Vital signs and physical exam findings (infer from context)
-                - Current medications mentioned
-
-                ASSESSMENT:
-                - Clinical assessment and differential diagnosis
-                - Connection between symptoms and medications
-
-                PLAN:
-                - Treatment recommendations
-                - Follow-up instructions
-                - Medication adjustments if needed
-
-                Keep the note professional, concise, and clinically accurate.
-                <</SYS>>
-
-                Patient Transcript: "{truncate_text(transcript, 1500)}"
-
-                Extracted Medical Information:
-                - Symptoms: {', '.join(symptoms) if symptoms else 'None reported'}
-                - Medications: {', '.join(medications) if medications else 'None reported'}
-
-                Please generate a comprehensive SOAP note based on this information. [/INST]"""
-            
-            # Tokenize and generate
-            inputs = MEDICAL_TOKENIZER(prompt, return_tensors="pt", truncation=True, max_length=2048)
-            
-            # FIX: Move inputs to the same device as the model
-            device = next(MEDICAL_LLM.parameters()).device
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            
-            # Generate response
-            with torch.no_grad():
-                outputs = MEDICAL_LLM.generate(
-                    **inputs,
-                    max_new_tokens=512,
-                    temperature=0.7,
-                    do_sample=True,
-                    top_p=0.9,
-                    pad_token_id=MEDICAL_TOKENIZER.eos_token_id,
-                    repetition_penalty=1.1
-                )
-            
-            # Decode and extract the generated text
-            generated_text = MEDICAL_TOKENIZER.decode(outputs[0], skip_special_tokens=True)
-            
-            # Extract only the assistant's response (after the instruction)
-            response = generated_text.split("[/INST]")[-1].strip()
-            
-            # Clean up any remaining special tokens
-            response = re.sub(r'<s>|</s>|\[INST\]|\[/INST\]', '', response).strip()
-            
-            return response
-            
-    except Exception as e:
-        logger.error(f"LLM SOAP generation failed: {e}")
-        # Fallback to rule-based
-        return generate_soap_note_rule_based(transcript, entities)
 
 # Model loading functions (updated to include medical LLM)
 async def load_models_async():
@@ -2297,125 +2585,6 @@ async def cleanup_models():
     
     logger.info("Thread pools shutdown completed")
 
-# API Endpoints (updated for LLM SOAP generation)
-@app.post("/process-audio", response_model=ProcessAudioResponse)
-async def process_audio(request: ProcessAudioRequest):
-    """Process audio data and return medical analysis with LLM-generated SOAP note and speaker diarization"""
-    request_id = str(uuid.uuid4())
-    
-    try:
-        logger.info(f"Processing audio request {request_id}")
-        
-        # Decode and validate audio
-        audio_bytes = base64.b64decode(request.audio_data)
-        
-        async with temp_audio_file(audio_bytes) as audio_path:
-            # Get audio duration for diarization alignment
-            audio_duration = await asyncio.get_event_loop().run_in_executor(
-                GENERAL_POOL, get_audio_duration, audio_path
-            )
-            
-            # Perform speaker diarization (async)
-            speaker_segments = []
-            diarization_model_used = "none"
-            if PYANNOTE_PIPELINE is not None:
-                try:
-                    speaker_segments = await asyncio.get_event_loop().run_in_executor(
-                        PYANNOTE_POOL, perform_diarization, audio_path
-                    )
-                    diarization_model_used = "pyannote/speaker-diarization-3.1"
-                    logger.info(f"Diarization found {len(speaker_segments)} speaker segments")
-                except Exception as e:
-                    logger.error(f"Diarization failed: {e}")
-                    diarization_model_used = "failed"
-            
-            # Transcription
-            if WHISPER_MODEL is not None:
-                try:
-                    result = await asyncio.get_event_loop().run_in_executor(
-                        WHISPER_POOL, 
-                        lambda: WHISPER_MODEL.transcribe(audio_path)
-                    )
-                    transcript = result.get("text", "")
-                    asr_model_used = f"whisper-{WHISPER_MODEL_SIZE}"
-                except Exception as e:
-                    logger.warning(f"Whisper transcription failed: {e}")
-                    transcript = await asyncio.get_event_loop().run_in_executor(
-                        GENERAL_POOL, 
-                        universal_transcript, audio_path
-                    )
-                    asr_model_used = "universal-fallback"
-            else:
-                transcript = await asyncio.get_event_loop().run_in_executor(
-                    GENERAL_POOL, 
-                    universal_transcript, audio_path
-                )
-                asr_model_used = "universal-fallback"
-            
-            # Align transcription with speaker segments if available
-            if speaker_segments:
-                speaker_segments = await asyncio.get_event_loop().run_in_executor(
-                    GENERAL_POOL,
-                    align_transcription_with_speakers, transcript, speaker_segments, audio_duration
-                )
-            
-            # Entity extraction
-            if BIOBERT_MODEL is not None:
-                entities, nlu_model_used = await asyncio.get_event_loop().run_in_executor(
-                    BIOBERT_POOL, 
-                    extract_medical_entities_sync, transcript
-                )
-            elif SPACY_MODEL is not None:
-                entities, nlu_model_used = await asyncio.get_event_loop().run_in_executor(
-                    SPACY_POOL, 
-                    extract_medical_entities_sync, transcript
-                )
-            else:
-                entities, nlu_model_used = await asyncio.get_event_loop().run_in_executor(
-                    GENERAL_POOL, 
-                    extract_medical_entities_sync, transcript
-                )
-            
-            # SOAP note generation with LLM
-            llm_model_used = "none"
-            if MEDICAL_LLM is not None:
-                try:
-                    soap_note = await asyncio.get_event_loop().run_in_executor(
-                        LLM_POOL, 
-                        generate_soap_note_llm, transcript, entities
-                    )
-                    llm_model_used = MEDICAL_LLM_NAME
-                except Exception as e:
-                    logger.error(f"LLM SOAP generation failed: {e}")
-                    soap_note = generate_soap_note_rule_based(transcript, entities)
-                    llm_model_used = "rule-based-fallback"
-            else:
-                soap_note = generate_soap_note_rule_based(transcript, entities)
-                llm_model_used = "rule-based"
-            
-            logger.info(f"Request {request_id} completed successfully")
-            
-            return ProcessAudioResponse(
-                status="success",
-                transcript=transcript,
-                entities=entities,
-                soap_note=soap_note,
-                speaker_segments=speaker_segments,  # Include speaker segments
-                model_used=asr_model_used,
-                nlu_model_used=nlu_model_used,
-                llm_model_used=llm_model_used,
-                diarization_model_used=diarization_model_used,  # Include diarization model info
-                request_id=request_id
-            )
-            
-    except Exception as e:
-        logger.error(f"Request {request_id} failed: {e}", exc_info=True)
-        return ProcessAudioResponse(
-            status="error",
-            error=f"Processing failed: {str(e)}",
-            request_id=request_id
-        )
-    
 # =====\========================================================================
 # WEBSOCKET ENDPOINT
 # =============================================================================
@@ -2520,37 +2689,6 @@ async def websocket_realtime_audio(websocket: WebSocket):
             pass
     finally:
         logger.info(f"🔚 WebSocket session ended: {session_id}")
-
-def test_negation_detection():
-    """Test if negation detection works on basic examples"""
-    print("\n" + "="*60)
-    print("🧪 TESTING NEGATION PATTERNS")
-    print("="*60)
-    
-    processor = NegationTemporalProcessor()
-    
-    # Test cases that SHOULD trigger negation
-    test_cases = [
-        "I have no chest pain",
-        "Patient denies shortness of breath",
-        "No fever or chills present", 
-        "Negative for diabetes",
-        "Without any nausea",
-        "I don't have headache"
-    ]
-    
-    for text in test_cases:
-        print(f"\n📝 Testing: '{text}'")
-        # Extract entities first
-        entities = extract_medical_entities_sync(text)[0]
-        
-        for entity in entities:
-            negation_info = processor.detect_negation(text, entity.text, entity.start)
-            print(f"  🔍 '{entity.text}': negated={negation_info['negated']} (confidence: {negation_info['confidence']})")
-            if negation_info['negated']:
-                print(f"     🎯 NEGATION PHRASE: '{negation_info['negation_phrase']}'")
-
-
 
 @app.get("/health")
 async def health():
