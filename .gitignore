@@ -12,4 +12,13 @@
 
 # Text files
 scripts/audio_data.txt
+scripts/doctor_patient_conversation.wav
+scripts/doctor_patient_long.wav
+clinicalbert_fine_tuning/train.csv
+clinicalbert_fine_tuning/test.csv
+clinicalbert_fine_tuning/sample_conversation.csv
+
 detail.txt
+
+# Csv files
+clinicalbert_fine_tuning/*.csv

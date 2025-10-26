@@ -86,6 +86,7 @@ logger = logging.getLogger("medical-nlp-service")
 # Global models (loaded asynchronously)
 WHISPER_MODEL = None
 BIOBERT_MODEL = None
+CLINICALBERT_MODEL = None
 SPACY_MODEL = None
 MEDICAL_LLM = None
 MEDICAL_TOKENIZER = None
@@ -463,7 +464,6 @@ class NegationTemporalProcessor:
         
         return None
 
-import re
 class MedicalConversationAnalyzer:
     """Analyzes clinical conversation patterns in real-time"""
     
@@ -1141,17 +1141,137 @@ def extract_medical_entities_with_negation_temporal(text: str) -> Tuple[List[Enh
     
     return enhanced_entities, f"{model_used}+negation_temporal"
 
+class HybridEntityExtractor:
+    def __init__(self, clinicalbert_model):
+        self.clinicalbert_model = clinicalbert_model
+        self.keyword_extractor = None
+        self.confidence_thresold = 0.7
+        self.processing_pool = ThreadPoolExecutor(max_workers=2)
+        self.clinicalbert_available = self.clinicalbert_model is not None
+        if not self.clinicalbert_available:
+            logger.warning("ClinicalBERT model is None - will use keyword fallback only")
+
+    def _map_bert_label_to_medical(self, bert_label: str) -> str:
+        label_mapping = {
+            # Common ClinicalBERT labels - adjust based on your fine-tuned model
+            "SYMPTOM": "SYMPTOM",
+            "MEDICATION": "MEDICATION", 
+            "DISEASE": "DIAGNOSIS",
+            "CONDITION": "DIAGNOSIS",
+            "PROCEDURE": "PROCEDURE",
+            "LAB_TEST": "LAB_TEST",
+            "BODY_PART": "BODY_PART",
+            "DOSAGE": "MEDICATION",
+            "FREQUENCY": "OTHER",
+            "DURATION": "OTHER"
+        }
+        # return label_mapping.get(bert_label, "OTHER")
+        return "OTHER"
+    
+    async def run_clinicalbert_extractor(self, text:str) -> List[EnhancedMedicalEntity]:
+        # ✅ ADD: Check availability first
+        if not self.clinicalbert_available:
+            logger.debug("ClinicalBERT not available, skipping")
+            return []
+        try:
+            loop = asyncio.get_event_loop()
+            raw_entities = await loop.run_in_executor(
+                self.processing_pool,
+                lambda: self.clinicalbert_model(text)
+            )
+            print("RAW ENTRIES", raw_entities)
+            entities = []
+            for entity in raw_entities:
+                entity_type = self._map_bert_label_to_medical(entity['entity_group'])
+
+                if entity_type != "OTHER":
+                    enhanced_entity = EnhancedMedicalEntity(
+                        entity=entity_type,
+                        text=entity['word'],
+                        start=entity['start'],
+                        end=entity['end'],
+                        confidence=float(entity['score']),
+                        negated=False,  # Will be handled by negation detector
+                        negation_confidence=0.0,
+                        duration=None,
+                        onset=None,
+                        normalized_duration=None,
+                        normalized_onset=None,
+                        temporal_context=None
+                    )
+                    entities.append(enhanced_entity)
+            logger.debug(f"ClinicalBERT extracted {len(entities)} entities")
+            return entities
+            
+        except Exception as e:
+            logger.error(f"ClinicalBERT entity extraction error: {e}")
+            return []
+        
+    def _has_sufficient_entities(self, entities: List[EnhancedMedicalEntity]) -> bool:
+        """Check if ClinicalBERT found enough high-confidence entities"""
+        if not entities:
+            return False
+        
+        high_confidence_entities = [
+            e for e in entities 
+            if e.confidence >= self.confidence_thresold
+        ]
+        return len(high_confidence_entities) >= 1 or len(entities) >= 3
+    
+    async def _extract_with_keyword_fallback(self, text: str) -> Tuple[List[EnhancedMedicalEntity], str]:
+        """Use existing keyword-based extraction as fallback"""
+        try:
+            entities, model_used = extract_medical_entities_sync(text)
+
+            enhanced_entities = []
+            for entity in entities:
+                if hasattr(entity, "negated"):
+                    enhanced_entities.append(entity)
+                else:
+                    enhanced_entity = EnhancedMedicalEntity(
+                        **entity.dict(),
+                        negated=False,
+                        negation_confidence=0.0,
+                        negation_phrase=None,
+                        duration=None,
+                        normalized_duration=None,
+                        onset=None,
+                        normalized_onset=None,
+                        temporal_context=None
+                    )
+                    enhanced_entities.append(enhanced_entity)
+            logger.info(f"Keyword fallback extracted {len(enhanced_entities)} entities")
+            return enhanced_entities, f"keyword_{model_used}"
+        
+        except Exception as e:
+            logger.error(f"Keyword fallback extraction error: {e}")
+            return [], "keyword_error"
+        
+    async def extract_entities(self, text: str) -> Tuple[List[EnhancedMedicalEntity], str]:
+        if not text.strip():
+            return [], "no_text"
+        
+        clinical_entities = await self.run_clinicalbert_extractor(text)
+        if self._has_sufficient_entities(clinical_entities):
+            logger.info(f"ClinicalBERT found {len(clinical_entities)} entities")
+            return clinical_entities, "clinical_bert"
+
+        return await self._extract_with_keyword_fallback(text)
+            
 class RealTimeMedicalProcessor:
     """Optimized real-time medical audio processor"""
     
     def __init__(self, whisper_model, medical_llm=None, pyannote_pipeline=None,
-                 biobert_model=None, spacy_model=None):
+                biobert_model=None, clinicalbert_model=None, spacy_model=None):
         self.whisper_model = whisper_model
         self.medical_llm = medical_llm
         self.pyannote_pipeline = pyannote_pipeline
         self.biobert_model = biobert_model
+        self.clinicalbert_model = clinicalbert_model
         self.spacy_model = spacy_model
         self.soap_builder = EnhancedSOAPBuilder()
+        
+        self.hybrid_extractor = HybridEntityExtractor(self.clinicalbert_model)
 
         self.conversation_analyzer = MedicalConversationAnalyzer()
         self.negation_processor = NegationTemporalProcessor()  # ← ADDED
@@ -1176,22 +1296,41 @@ class RealTimeMedicalProcessor:
             return []
         
         try:
-            loop = asyncio.get_event_loop()
-            entities, model_used = await loop.run_in_executor(
-                self.processing_pool,
-                extract_medical_entities_with_negation_temporal, transcript
-            )
-            
-            # 🔍 ADD THIS DEBUG
-            print(f"🔍 ENTITY EXTRACTION DEBUG: {len(entities)} entities found using {model_used}")
-            if entities:
-                print(f"🔍 FIRST ENTITY TYPE: {type(entities[0]).__name__}")
-                print(f"🔍 HAS NEGATED ATTR: {hasattr(entities[0], 'negated')}")
+            entities, model_used = await self.hybrid_extractor.extract_entities(transcript)
+
+            # Log the extraction method
+            logger.info(f"🔍 HYBRID EXTRACTION: {len(entities)} entities using {model_used}")
+
+            if model_used == "clinical_bert" and entities:
+                clinical_entities = [e for e in entities if e.confidence >= 0.7]
+                logger.info(f"🔍 CLINICALBERT: {len(clinical_entities)} high-confidence entities")
+                for entity in clinical_entities[:3]:  # Log first 3
+                    logger.info(f"🔍   - {entity.entity}: '{entity.text}' (conf: {entity.confidence:.2f})")
             
             return entities
         except Exception as e:
-            logger.error(f"Enhanced entity extraction error: {e}")
-            return []
+            logger.error(f"Hybrid entity extraction error: {e}")
+            return await self._fallback_entity_extraction(transcript)
+
+    async def _fallback_entity_extraction(self, transcript: str) -> List[EnhancedMedicalEntity]:
+            try:
+                loop = asyncio.get_event_loop()
+                entities, model_used = await loop.run_in_executor(
+                    self.processing_pool,
+                    extract_medical_entities_with_negation_temporal, transcript
+                )
+
+                logger.info(f"🔍 FALLBACK EXTRACTION: {len(entities)} entities using {model_used}")
+                # 🔍 ADD THIS DEBUG
+                print(f"🔍 ENTITY EXTRACTION DEBUG: {len(entities)} entities found using {model_used}")
+                if entities:
+                    print(f"🔍 FIRST ENTITY TYPE: {type(entities[0]).__name__}")
+                    print(f"🔍 HAS NEGATED ATTR: {hasattr(entities[0], 'negated')}")
+                
+                return entities
+            except Exception as e:
+                logger.error(f"Enhanced entity extraction error: {e}")
+                return []
 
     def _format_current_soap(self, sections: Dict[str, str]) -> str:
         """Format the current SOAP state and remove empty lines"""
@@ -2339,7 +2478,7 @@ def load_spacy_with_ruler():
 # Model loading functions (updated to include medical LLM)
 async def load_models_async():
     """Asynchronously load all models including medical LLM"""
-    global WHISPER_MODEL, PYANNOTE_PIPELINE ,BIOBERT_MODEL, SPACY_MODEL, MEDICAL_LLM, MEDICAL_TOKENIZER, _models_loaded
+    global WHISPER_MODEL, PYANNOTE_PIPELINE ,BIOBERT_MODEL, CLINICALBERT_MODEL, SPACY_MODEL, MEDICAL_LLM, MEDICAL_TOKENIZER, _models_loaded
     global REALTIME_PROCESSOR  # Add this
 
     with _model_load_lock:
@@ -2369,12 +2508,21 @@ async def load_models_async():
             try:
                 def _load_biobert():
                     from transformers import pipeline
-                    return pipeline(
+                    
+                    if torch.cuda.is_available():
+                        device = 0
+                    torch.set_default_device('cpu')
+                    torch.set_default_dtype(torch.float32)
+                    device = -1
+                    biopipe = pipeline(
                         "ner",
                         model="dmis-lab/biobert-v1.1",
                         tokenizer="dmis-lab/biobert-v1.1",
-                        aggregation_strategy="simple"
+                        aggregation_strategy="simple",
+                        device=device,
+                        torch_dtype=torch.float32  # Explicit dtype
                     )
+                    return biopipe
                 
                 model = await asyncio.get_event_loop().run_in_executor(
                     GENERAL_POOL, _load_biobert
@@ -2384,7 +2532,34 @@ async def load_models_async():
             except Exception as e:
                 logger.warning(f"BioBERT failed: {e}")
                 return None
-        
+            
+        async def load_clinicalBert():
+            try:
+                def _load_clinicalBert():
+                    from transformers import pipeline
+                    if torch.cuda.is_available():
+                        device = 0
+                    torch.set_default_device('cpu')
+                    torch.set_default_dtype(torch.float32)
+                    device = -1
+                    clinicPipe = pipeline(
+                        "ner",
+                        model="emilyalsentzer/Bio_ClinicalBERT",
+                        tokenizer="emilyalsentzer/Bio_ClinicalBERT",
+                        aggregation_strategy="simple",
+                        device=device,
+                        torch_dtype=torch.float32
+                    )
+                    return clinicPipe
+                model = await asyncio.get_event_loop().run_in_executor(
+                    GENERAL_POOL, _load_clinicalBert
+                )
+                logger.info("✓ ClinicalBERT model loaded successfully")
+                return model
+            except Exception as e:
+                logger.warning(f"ClinicalBERT failed: {e}")
+                return None
+            
         async def load_spacy():
             try:
                 model = await asyncio.get_event_loop().run_in_executor(
@@ -2519,6 +2694,7 @@ async def load_models_async():
         results = await asyncio.gather(
             load_whisper(),
             load_biobert(),
+            load_clinicalBert(),
             load_spacy(),
             load_pyannote(),
             load_medical_llm(),
@@ -2539,7 +2715,7 @@ async def load_models_async():
             else:
                 sanitized_results.append(result)
         
-        WHISPER_MODEL, BIOBERT_MODEL, SPACY_MODEL, PYANNOTE_PIPELINE, llm_result = sanitized_results
+        WHISPER_MODEL, BIOBERT_MODEL, CLINICALBERT_MODEL, SPACY_MODEL, PYANNOTE_PIPELINE, llm_result = sanitized_results
 
         # Then handle the LLM result
         if llm_result and isinstance(llm_result, tuple) and len(llm_result) == 2:
@@ -2556,6 +2732,7 @@ async def load_models_async():
             medical_llm=MEDICAL_LLM,
             pyannote_pipeline=PYANNOTE_PIPELINE,
             biobert_model=BIOBERT_MODEL,
+            clinicalbert_model=CLINICALBERT_MODEL,
             spacy_model=SPACY_MODEL
         )
         logger.info("Real-time medical processor initialized")
@@ -2697,12 +2874,14 @@ async def health():
         "models_loaded": {
             "whisper": WHISPER_MODEL is not None,
             "biobert": BIOBERT_MODEL is not None,
+            "clinicalbert": CLINICALBERT_MODEL is not None,
             "spacy": SPACY_MODEL is not None,
             "medical_llm": MEDICAL_LLM is not None
         },
         "thread_pools": {
             "whisper_pool": WHISPER_POOL._max_workers,
             "biobert_pool": BIOBERT_POOL._max_workers,
+            "clinical_pool": CLINICALBERT_MODEL.max_workers,
             "spacy_pool": SPACY_POOL._max_workers,
             "general_pool": GENERAL_POOL._max_workers,
             "llm_pool": LLM_POOL._max_workers
